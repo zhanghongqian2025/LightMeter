@@ -142,6 +142,13 @@ class RedactionApiTest {
         assertEquals("scanned", s.get("stage").asText());
         assertEquals(2, s.get("summary").get("distinctHits").asInt(), scan.body());
         assertEquals(2, s.get("summary").get("occurrences").asInt(), scan.body());
+        JsonNode scanIdentity = s.get("toolIdentity");
+        assertEquals("1.1.4", scanIdentity.get("toolVersion").asText(), scan.body());
+        assertTrue(scanIdentity.get("toolArtifactSha256").isNull(),
+                "测试从 classes 目录运行，不应伪造单一 jar 摘要");
+        assertFalse(scanIdentity.get("usedModel").asBoolean(), scan.body());
+        assertFalse(scanIdentity.get("signatureVerified").asBoolean(), scan.body());
+        assertFalse(scanIdentity.get("strictProductionEligible").asBoolean(), scan.body());
 
         // 命中项必须带 (规则键, 原值) —— 这正是界面回传排除项时要用的键
         JsonNode hits = s.get("hits");
@@ -170,6 +177,8 @@ class RedactionApiTest {
         assertEquals("applied", a.get("stage").asText());
         assertEquals(1, a.get("summary").get("excluded").asInt(), apply.body());
         assertEquals(1, a.get("summary").get("distinctHits").asInt(), apply.body());
+        assertEquals(scanIdentity, a.get("toolIdentity"),
+                "无模型的同一次处理仍要把确切工具身份带到 apply 结果");
 
         // 下载
         LocalServerApiTest.Raw.Res dl = LocalServerApiTest.Raw.req(port, "GET",

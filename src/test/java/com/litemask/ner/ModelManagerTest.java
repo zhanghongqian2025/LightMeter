@@ -134,6 +134,12 @@ class ModelManagerTest {
         assertNotNull(s.modelPackageSha256(), "要报出被签名发布包的摘要");
         assertEquals(ModelPackageSignature.keyIdOf(kp.getPublic()), s.modelSigningKeyId(),
                 "要报出实际验签使用的密钥标识");
+        com.litemask.core.ProcessingIdentity processing = m.processingIdentity();
+        assertEquals(s.modelId(), processing.modelId());
+        assertEquals(s.modelVersionKey(), processing.modelVersionKey());
+        assertEquals(s.modelPackageSha256(), processing.modelPackageSha256());
+        assertEquals(s.modelSigningKeyId(), processing.modelSigningKeyId());
+        assertTrue(processing.signatureVerified());
         assertTrue(s.personName(), "要报出支持人名识别");
         assertTrue(s.organizationName(), "要报出支持机构名识别");
         assertTrue(s.bundledAvailable(), "要说清楚安装包里带了随附模型");
@@ -164,6 +170,11 @@ class ModelManagerTest {
         assertTrue(developer.usable(), "显式 --ner-model 开发/排障入口应保持可用");
         assertEquals(ModelManager.State.READY, developer.state(), "显式目录加载成功也应报就绪");
         assertFalse(developer.signatureVerified(), "显式直载目录不能被标成已验签");
+        com.litemask.core.ProcessingIdentity developerProcessing = explicit.processingIdentity();
+        assertTrue(developerProcessing.usedModel());
+        assertEquals(developer.modelId(), developerProcessing.modelId());
+        assertFalse(developerProcessing.signatureVerified());
+        assertFalse(developerProcessing.strictProductionEligible());
         explicit.close();
     }
 

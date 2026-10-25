@@ -3,6 +3,8 @@ package com.litemask.ner;
 import com.litemask.core.EntitySource;
 import com.litemask.core.ExclusiveGate;
 import com.litemask.core.Match;
+import com.litemask.core.ProcessingIdentity;
+import com.litemask.core.ToolIdentity;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -543,6 +545,36 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
                 bundled.map(BundledPackage::modelId).orElse(null),
                 canRollback(),
                 failure);
+    }
+
+    /**
+     * 取得与当前推理来源一致的不可变身份快照。
+     *
+     * <p>读锁把「读注册表/来源」与模型换装隔开；扫描方在同一把闸门内取得本快照并运行
+     * 推理，因此不会出现“命中由 A 产生、身份却在结束后读成 B”的串版。
+     */
+    public ProcessingIdentity processingIdentity() {
+        lock.readLock().lock();
+        try {
+            NerModelRegistry current = registry.get();
+            boolean usedModel = current != null && current.isEnabled();
+            if (!usedModel) {
+                return ProcessingIdentity.withoutModel();
+            }
+            NerModelPackage.Manifest manifest = manifestOf(current);
+            ModelPackageStore.Provenance provenance = activeProvenance;
+            return new ProcessingIdentity(
+                    ToolIdentity.version(),
+                    ToolIdentity.artifactSha256(),
+                    true,
+                    manifest == null ? null : manifest.id(),
+                    provenance == null ? null : provenance.versionKey(),
+                    provenance == null ? null : provenance.packageSha256(),
+                    provenance == null ? null : provenance.signingKeyId(),
+                    provenance != null);
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     /**

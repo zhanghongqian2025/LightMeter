@@ -93,7 +93,8 @@ public final class ApiHandlers {
                                 List<com.litemask.core.EntitySource> sources,
                                 com.litemask.core.ExclusiveGate gate,
                                 com.litemask.ner.ModelManager models) {
-        JobStore jobs = new JobStore(workspace, rules, sources, gate);
+        JobStore jobs = new JobStore(workspace, rules, sources, gate,
+                models == null ? null : models::processingIdentity);
         TaskRunner tasks = new TaskRunner(jobs, TaskRunner.DEFAULT_TIMEOUT_MS);
         server.onClose(tasks);
         registerRoutes(server, workspace, rules, sources, jobs, tasks, models, gate);

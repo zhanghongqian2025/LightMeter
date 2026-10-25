@@ -1,8 +1,10 @@
 package com.litemask.server;
 
 import com.litemask.core.Exclusions;
+import com.litemask.core.ProcessingIdentity;
 import com.litemask.core.Rule;
 import com.litemask.core.TaskContext;
+import com.litemask.core.ToolIdentity;
 import com.sun.net.httpserver.HttpExchange;
 
 import java.io.IOException;
@@ -73,6 +75,8 @@ public final class JobStore {
      * 这把闸门就是那件事的落点：扫描期间持锁，换模型要拿写锁。
      */
     private final com.litemask.core.ExclusiveGate gate;
+    /** 在扫描持有模型闸门时读取，保证身份与实际使用的推理来源是同一时刻。 */
+    private final ProcessingIdentity.Provider identityProvider;
 
     public JobStore(Workspace workspace, List<Rule> rules) {
         this(workspace, rules, List.of());
@@ -106,10 +110,18 @@ public final class JobStore {
     public JobStore(Workspace workspace, List<Rule> rules,
                     List<com.litemask.core.EntitySource> sources,
                     com.litemask.core.ExclusiveGate gate) {
+        this(workspace, rules, sources, gate, null);
+    }
+
+    public JobStore(Workspace workspace, List<Rule> rules,
+                    List<com.litemask.core.EntitySource> sources,
+                    com.litemask.core.ExclusiveGate gate,
+                    ProcessingIdentity.Provider identityProvider) {
         this.workspace = workspace;
         this.rules = rules;
         this.sources = sources == null ? List.of() : List.copyOf(sources);
         this.gate = gate == null ? com.litemask.core.ExclusiveGate.NONE : gate;
+        this.identityProvider = identityProvider;
     }
 
     /** 一个任务的全部状态。字段都是 final，除了 outputName（apply 之后才有）。 */
@@ -148,7 +160,11 @@ public final class JobStore {
          * 「规则没命中」与「规则没命中且人名识别没开」对用户的意义完全不同
          * —— 后者意味着文档里的人名**根本没被找过**。
          */
-        final boolean nerEnabled;
+        volatile boolean nerEnabled;
+        /** 最近一次扫描/重扫实际使用的不可变工具与模型身份。 */
+        volatile ProcessingIdentity scanIdentity;
+        /** 成品实际使用的身份；无排除项时与 scanIdentity 是同一个快照。 */
+        volatile ProcessingIdentity appliedIdentity;
         volatile String outputName;
         /**
          * 映射件的磁盘名。apply 之后才有。
@@ -203,6 +219,14 @@ public final class JobStore {
         Job(String jobId, String sourceName, String previewName, String displayName,
             String extension, DocumentService.Format format, DocumentService.Result scan,
             boolean nerEnabled) {
+            this(jobId, sourceName, previewName, displayName, extension, format, scan,
+                    new ProcessingIdentity(ToolIdentity.version(), ToolIdentity.artifactSha256(),
+                            nerEnabled, null, null, null, null, false));
+        }
+
+        Job(String jobId, String sourceName, String previewName, String displayName,
+            String extension, DocumentService.Format format, DocumentService.Result scan,
+            ProcessingIdentity scanIdentity) {
             this.jobId = jobId;
             this.sourceName = sourceName;
             this.previewName = previewName;
@@ -210,7 +234,8 @@ public final class JobStore {
             this.extension = extension;
             this.format = format;
             this.scan = scan;
-            this.nerEnabled = nerEnabled;
+            this.scanIdentity = scanIdentity;
+            this.nerEnabled = scanIdentity.usedModel();
         }
 
         public String jobId() {
@@ -387,7 +412,9 @@ public final class JobStore {
 
         String previewName = workspace.newDiskName(stored.extension());
         DocumentService.Result result;
+        ProcessingIdentity identity;
         try (com.litemask.core.ExclusiveGate.Release release = gate.acquire()) {
+            identity = captureIdentity();
             result = TaskContext.in(ctx, () -> DocumentService.redact(
                     workspace.pathOf(stored.diskName()), workspace.pathOf(previewName),
                     format, rules, Exclusions.NONE, sources));
@@ -401,7 +428,7 @@ public final class JobStore {
 
         Job job = new Job(UUID.randomUUID().toString().replace("-", ""),
                 stored.diskName(), previewName, stored.displayName(),
-                stored.extension(), format, result, nerParticipated());
+                stored.extension(), format, result, identity);
         synchronized (this) {
             jobs.put(job.jobId, job);
         }
@@ -473,6 +500,16 @@ public final class JobStore {
         return false;
     }
 
+    private ProcessingIdentity captureIdentity() {
+        if (identityProvider != null) {
+            return java.util.Objects.requireNonNull(identityProvider.snapshot(),
+                    "身份提供器不能返回 null");
+        }
+        boolean usedModel = nerParticipated();
+        return new ProcessingIdentity(ToolIdentity.version(), ToolIdentity.artifactSha256(),
+                usedModel, null, null, null, null, false);
+    }
+
     /**
      * 用（含补充词的）规则重扫一遍，换掉预览件。
      *
@@ -482,7 +519,9 @@ public final class JobStore {
     private void rescan(Job job) throws IOException {
         String newPreview = workspace.newDiskName(job.extension);
         DocumentService.Result result;
+        ProcessingIdentity identity;
         try (com.litemask.core.ExclusiveGate.Release release = gate.acquire()) {
+            identity = captureIdentity();
             result = DocumentService.redact(workspace.pathOf(job.sourceName),
                     workspace.pathOf(newPreview), job.format, rulesWithUserTerms(job),
                     Exclusions.NONE, sources);
@@ -494,6 +533,8 @@ public final class JobStore {
         String old = job.previewName;
         job.previewName = newPreview;
         job.scan = result;
+        job.scanIdentity = identity;
+        job.nerEnabled = identity.usedModel();
         if (old != null) {
             workspace.delete(old);
         }
@@ -675,9 +716,12 @@ public final class JobStore {
         if (excl.isEmpty()) {
             job.outputName = job.previewName;
             job.applied = job.scan;
+            job.appliedIdentity = job.scanIdentity;
         } else {
             String outName = workspace.newDiskName(job.extension);
+            ProcessingIdentity identity;
             try (com.litemask.core.ExclusiveGate.Release release = gate.acquire()) {
+                identity = captureIdentity();
                 job.applied = DocumentService.redact(workspace.pathOf(job.sourceName),
                         workspace.pathOf(outName), job.format, rulesWithUserTerms(job), excl, sources);
             } catch (TaskContext.CanceledException e) {
@@ -686,6 +730,7 @@ public final class JobStore {
                 throw e;
             }
             job.outputName = outName;
+            job.appliedIdentity = identity;
         }
         // 映射件必须**跟着应用一起产出**。
         // 脱敏件已经能下载了，而映射只在内存里的话，用户拿到的是一份「不可逆」的文件——
@@ -723,6 +768,7 @@ public final class JobStore {
         payload.put("mapping", job.applied.mapping());
         payload.put("format", job.format.name());
         payload.put("source", job.displayName);
+        payload.put("toolIdentity", identityMap(job.appliedIdentity));
         List<Map<String, Object>> changes = new ArrayList<>();
         for (DocumentService.HitItem h : job.applied.hits()) {
             Map<String, Object> item = new LinkedHashMap<>();
@@ -1104,6 +1150,8 @@ public final class JobStore {
         out.put("formatLabel", job.format.label());
         out.put("fileName", job.displayName());
         out.put("downloadName", job.downloadName());
+        ProcessingIdentity identity = "applied".equals(stage) ? job.appliedIdentity : job.scanIdentity;
+        out.put("toolIdentity", identityMap(identity));
         if (job.mappingName != null) {
             // 只有应用过才有映射件与还原件。scan 阶段报这两个名字会让界面
             // 以为「现在就能下载映射」——那时候点下去只会拿到一个 400。
@@ -1171,6 +1219,22 @@ public final class JobStore {
             hits.add(item);
         }
         out.put("hits", hits);
+        return out;
+    }
+
+    private static Map<String, Object> identityMap(ProcessingIdentity identity) {
+        ProcessingIdentity actual = java.util.Objects.requireNonNull(identity,
+                "作业缺少处理身份快照，拒绝用当前状态替代旧作业身份");
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("toolVersion", actual.toolVersion());
+        out.put("toolArtifactSha256", actual.toolArtifactSha256());
+        out.put("usedModel", actual.usedModel());
+        out.put("modelId", actual.modelId());
+        out.put("modelVersionKey", actual.modelVersionKey());
+        out.put("modelPackageSha256", actual.modelPackageSha256());
+        out.put("modelSigningKeyId", actual.modelSigningKeyId());
+        out.put("signatureVerified", actual.signatureVerified());
+        out.put("strictProductionEligible", actual.strictProductionEligible());
         return out;
     }
 }
