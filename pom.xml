@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.litemask</groupId>
+  <artifactId>desens-desktop</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <name>轻量单机脱敏工具</name>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <jackson.version>2.17.1</jackson.version>
+    <junit.version>5.10.2</junit.version>
+    <pdfbox.version>3.0.3</pdfbox.version>
+    <ofdrw.version>2.4.0</ofdrw.version>
+    <onnxruntime.version>1.20.0</onnxruntime.version>
+  </properties>
+
+  <dependencies>
+    <!-- M0 只需要 JSON 解析；数据库推迟到 M2，避免过早进包 -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <!--
+      PDF 管线（M1-d）必须引入 PDFBox：OOXML 那套 zip+DOM 的做法在 PDF 上不成立——
+      PDF 没有「文本节点」这个概念，字符被切成字节码嵌在内容流的算子里，
+      字体是子集内嵌的、编码是自定义的，要还原出「用户看到的字」只能靠字体与 ToUnicode。
+      这正是「高层库覆盖不到的位置」判据的另一个方向：这里不是怕库漏，
+      而是这个领域根本没有可替代的零依赖实现。
+
+      实测体积：pdfbox 2.0MB + fontbox 1.6MB + pdfbox-io 48KB + commons-logging 72KB ≈ 3.7MB。
+      bouncycastle（bcprov 8.3MB + bcpkix 1.1MB）在 pdfbox 的 pom 里是 optional，不会进依赖树；
+      本项目不支持加密 PDF，遇到加密文件一律 fail-closed 报错，因此也不需要它。
+    -->
+    <dependency>
+      <groupId>org.apache.pdfbox</groupId>
+      <artifactId>pdfbox</artifactId>
+      <version>${pdfbox.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.pdfbox</groupId>
+      <artifactId>fontbox</artifactId>
+      <version>${pdfbox.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.pdfbox</groupId>
+      <artifactId>pdfbox-io</artifactId>
+      <version>${pdfbox.version}</version>
+    </dependency>
+
+    <!--
+      docx 刻意**不**引入 POI（实测 poi-ooxml 栈合计 18.4MB，占 L0 预算 55MB 的三分之一），
+      改用 JDK 自带的 zip + DOM。理由不是省体积，是覆盖面：
+      文本框里的段落位于 w:txbxContent/w:p，POI 不把它建模为 XWPFParagraph，
+      用 POI 就得同时维护 XWPF 遍历和 XMLBeans 遍历两套机制，漏掉一层就是静默漏脱。
+      DOM 一次深度优先遍历即可无差别覆盖 body/表格/页眉页脚/文本框/批注/脚注。
+
+      xlsx（共享字符串索引、单元格类型、公式）与 pptx 在 M1-b/c 再引入 POI-lite。
+    -->
+
+    <!--
+      OFD 管线（M1-e）**不引入** ofdrw，和 OOXML 一样只用 JDK 的 zip + DOM。
+      判据一致：OFD 的文本位置是可穷举的（TextCode 元素内容 + TextCode@Text +
+      DocInfo + 附件名），把清单列出来本身就是覆盖率证明；而引库换来的是「我大概都处理了」。
+      但 ofdrw 只作为**测试作用域**的独立读取器进来：
+      被测实现自己写 XML、自己读 XML，用自己验证自己等于没验证——
+      测试里必须有一个不是我们写的读取器，去确认「我们改完的文件别人还读得动」。
+      test scope 不进 shaded jar，对成品体积零影响。
+    -->
+    <dependency>
+      <groupId>org.ofdrw</groupId>
+      <artifactId>ofdrw-reader</artifactId>
+      <version>${ofdrw.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      M3 NER 推理引擎。定版 1.20.0 的理由见 docs/M3-选型与体积实测.md：
+      1.31.0（最新版）单平台 native 就有 27.9MB，会把 L2 的 39MB 预算吃掉 72%；
+      1.20.0 是 15.5MB，且比 1.18/1.19 更小 —— 版本新旧与体积大小在这里不冲突。
+      版本下限 ≥1.17.0。
+
+      这个 jar 是**零依赖**的（内嵌 pom 里没有任何 dependencies），不会带进新的传递依赖。
+
+      jar 本身 92,987,839 B，里面塞了 5 个平台的 native：
+        linux-aarch64 13.6MB / linux-x64 16.6MB / osx-aarch64 25.4MB
+        osx-x64 28.6MB / win-x64 11.6MB，外加 osx 的 dSYM DWARF 约 18.5MB。
+      直接打进 shaded jar 会让成品从 6MB 变成 93MB，因此**按平台裁剪**，
+      由下面的 profile 决定保留哪一个（构建机是 macOS 时默认走 mac-arm）。
+      注意 dSYM 里的文件名是 `libonnxruntime.dylib`，**按后缀排除原生库会漏掉它**，
+      所以必须按目录 `**/*.dSYM/**` 排除。
+
+      尚未处理（见 M3-4）：strip。本地保留的是**未 strip 的 25.4MB**，
+      剥离后是 15.5MB。M3-4 会在打包脚本里做，不放进 pom，
+      因为 strip 是平台相关的工具，Windows 构建机上没有它。
+    -->
+    <dependency>
+      <groupId>com.microsoft.onnxruntime</groupId>
+      <artifactId>onnxruntime</artifactId>
+      <version>${onnxruntime.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>desens-core</finalName>
+
+    <!--
+      资源：默认的 src/main/resources + 一份**身份表**。
+
+      【为什么要把 tools/package-identity.properties 带进 jar】
+        顶层 help 顶部要显示版本号。以前那里写死的是「· M3-2」——
+        那是**阶段标签**而不是版本号，项目走到 M4 之后它就过期了，
+        而过期了**没有任何东西会报**（编译不红、测试不红，help 照打不误）。
+        → 版本号只写在 tools/package-identity.properties 一处
+          （那是**跨端唯一真源**，macOS / Windows 两个打包脚本都从它读），
+          构建时原样带进 jar，运行时由 ProductIdentity 从 classpath 读回来。
+        → 于是「安装器里显示的版本」与「命令行 help 里显示的版本」**必然一致**：
+          它们读的是同一个文件，而不是各写一份。
+
+      【为什么不过滤（filtering=false）】
+        这份表里有大段中文注释。过滤会在注释里找 ${...}，
+        一旦有人在注释里写了个 ${ 就会把构建搞挂 —— 原样带进去最省事。
+    -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+      <resource>
+        <directory>${project.basedir}/tools</directory>
+        <includes>
+          <include>package-identity.properties</include>
+        </includes>
+        <targetPath>META-INF/litemask</targetPath>
+        <filtering>false</filtering>
+      </resource>
+    </resources>
+
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <!--
+            测试报告用中文断言信息，失败时直接可读。
+
+            这里的 -Djava.io.tmpdir **必须在 JVM 启动时给**，不能用
+            surefire 的 systemPropertyVariables 给 —— 这不是风格问题，是
+            2026-10-20 块 14 实测踩出来的**空断言**（详见下面那段注释）。
+          -->
+          <argLine>-Dfile.encoding=UTF-8 -Djava.io.tmpdir=${project.build.directory}</argLine>
+          <!--
+            把测试期的 user.home 指到 target 下，**不是**为了绕开断言，是为了让断言本身自证。
+
+            NerWiringTest.registryDisabledWithGuidance 会断言「本机 ~/.litemask/models/ner
+            不存在模型包」——按文档装完模型的用户，这一条会**永久变红**，而红的原因与被测代码
+            无关（这条红是我自己在验收装模型后亲手制造出来的）。
+
+            为什么必须用 systemPropertyVariables 而不是 `env -i HOME=...`：
+            macOS/Unix 的 JVM 取 user.home 走 passwd 而不是 HOME 环境变量，
+            改 HOME 根本没效果（已实测）。只有直接设系统属性才真的隔离得开。
+
+            这里的隔离只影响「测试期去找用户目录」的代码路径，不放宽任何断言：
+            target/test-home 会被清空重建，所以前提断言仍然是「真的没有模型包」，
+            只是这个「没有」不再取决于开发机当时装没装过东西。
+          -->
+          <systemPropertyVariables>
+            <user.home>${project.build.directory}/test-home</user.home>
+            <!--
+              临时目录基准也指到本构建的 target 下（2026-10-20 块 14 补上）。
+
+              【为什么必须隔离】ModelDownloadTest.下载用的临时目录不留下残留
+              断言的是「下载用的临时目录必须删掉」，它的观测方式是
+              **数 java.io.tmpdir 下以 litemask-model-download- 开头的目录个数**，
+              前后各数一次、要求相等。
+              → 那个基准是**全机共享**的（macOS 上是 /var/folders/…/T）。
+              四路并行跑对照实验时（主树 + 3 个副本，各自一套 surefire JVM），
+              每一路都在同一个基准里创建并删除自己的下载临时目录：
+              A 路「数之前」与「数之后」之间，B 路建了一个目录 → 计数对不上
+              → **两路直接红在「起飞前基线不是绿的」**。
+              （实测：2026-10-20 块 14 的第一轮里 w0 与 w3 两路就是这样没的，
+              报的是 ModelDownloadTest 期望 37、实际 36。）
+
+              【为什么不改断言】那个断言的**前提**是「下载没留下临时目录」，
+              它没有错；错的是**观测的基准不私有**——在共享基准上数个数，
+              数的就不只是「这次下载留下的东西」。
+              → 修的是**前提**（让基准私有），不是断言。
+              与上面 user.home 的隔离是同一个道理：不放宽任何断言，
+              只是让「这个数到底是多少」不再取决于别的进程。
+
+              【为什么指到 target 而不是新建 test-tmp】target 目录在构建期一定存在
+              （compile 阶段就会建出来），不用额外加插件去创建；
+              而 target 会被 mvn clean 回收，测试期产生的临时文件不会留在系统盘上。
+              每条对照实验的副本有自己的 target/ → 各自的基准互不干扰。
+
+              【为什么这一条不能写在 systemPropertyVariables 里 —— 2026-10-20 实测】
+              第一版就写在 systemPropertyVariables 里，结果**修出了空断言**：
+              surefire 的 systemPropertyVariables 是**JVM 启动之后**才设的属性，
+              而 Files.createTempDirectory 用的是 sun.nio.fs.TempFileHelper 里
+              **类加载时缓存**的 defaultTmpDir（java.io.tmpdir 只在类加载时读一次）。
+              → 属性值是对的（surefire 报告里查得到 java.io.tmpdir=…/target），
+                **但下载用的临时目录仍然建在 /var/folders/…/T**；
+                而断言数的是 target/ → 前后都是 0 → **断言恒为真**。
+              后果实测：对照实验里的「破坏➯：下载用的临时目录不清理」
+              （把 deleteRecursively 去掉、故意留残留）**咬不住了**——
+              变异体写进去了、测试也跑了，但测试根本看不见那个残留目录。
+              换句话说：那次「修复」把一条真断言改成了一条永远为真的假断言，
+              而它**长得像成功**（四路并行的假红确实消失了）。
+
+              → 所以这一条必须走 **argLine 的 -D（JVM 启动时生效）**，
+                让 TempFileHelper 在类加载时就拿到正确的基准。
+              并且这件事本身有守卫：TempBaseIsolationTest 不看属性值，
+              而是**真的建一个临时目录、看它落在哪儿**。
+            -->
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <mainClass>com.litemask.cli.Main</mainClass>
+            </manifest>
+          </archive>
+        </configuration>
+      </plugin>
+    <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.2</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.litemask.cli.Main</mainClass>
+                </transformer>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+
+                    <!--
+                      ORT 的 native 裁剪。本项目只交付 Windows x64 与 macOS arm64，
+                      同一份 jar 里放两套，由 ORT 运行时按平台自己挑，
+                      不需要按平台出两个 jar。
+
+                      排除的四类各有各的理由：
+                      1. linux-* —— 不交付，13.6+16.6=30.2MB 白进包；
+                      2. osx-x64 —— Intel Mac 不交付，28.6MB；将来要支持就删掉这一行；
+                      3. *.dSYM/** —— macOS 调试符号约 18.5MB，**必须按目录排除**：
+                         dSYM 里的文件名就是 libonnxruntime.dylib，
+                         按后缀排除原生库会把它们漏进来；
+                      4. *.pdb —— Windows 调试符号，**onnxruntime.pdb 单个就有 304,648,192 B
+                         （290MB）**。这一条是实测才发现的：只排除了 dSYM 就以为完事了，
+                         结果 fat jar 变成 76.47MiB，其中大半是一个压过一遍也还有几十 MB 的 PDB。
+                         对称地想：两个平台的调试符号都要单独处理，漏一边就白干。
+                    -->
+                    <exclude>ai/onnxruntime/native/linux-aarch64/**</exclude>
+                    <exclude>ai/onnxruntime/native/linux-x64/**</exclude>
+                    <exclude>ai/onnxruntime/native/osx-x64/**</exclude>
+                    <exclude>**/*.dSYM/**</exclude>
+                    <exclude>**/*.pdb</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

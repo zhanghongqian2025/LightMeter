@@ -1,0 +1,332 @@
+/* 脱敏工具的界面。刻意不用框架：页面只有几十行，
+   引进来只会让「核心包多大」这个问题多一个说不清的部分。 */
+
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --ink: #1b1f24;
+  --muted: #6b7280;
+  --line: #e3e6ea;
+  --ok: #14804a;
+  --warn: #9a6700;
+  --accent: #1f5fd0;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.65 -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+}
+
+.top { padding: 26px 28px 10px; }
+.brand { display: flex; align-items: center; gap: 10px; }
+h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+.sub { margin: 6px 0 0 26px; color: var(--muted); font-size: 14px; }
+
+.dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #b9bec6; display: inline-block;
+}
+.dot.ok { background: var(--ok); }
+.dot.bad { background: #c0392b; }
+
+/* grid-template-columns: minmax(0, 1fr) 与 .card 的 min-width: 0 是一对。
+   缺了任何一半，窄屏下都会被内容顶开：
+   - 缺 minmax(0,1fr)：auto 列的基准尺寸是各项的 min-content 贡献，
+     而规则表那种宽表格的 min-content 有 500 多像素，于是整列被撑宽；
+   - 缺 min-width: 0：网格项的自动最小尺寸默认是 min-width:auto，
+     同样被内容顶开。
+   两处都放开之后，宽表格由 .scroll 自己横向滚动，页面不再横向溢出。 */
+main {
+  padding: 10px 28px 8px; display: grid; gap: 14px; max-width: 1180px;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+  min-width: 0;
+}
+.card.pending { border-style: dashed; background: #fbfbfc; }
+.card h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
+
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+.pending-note { margin: 10px 0 0; color: var(--warn); font-size: 13px; }
+
+/* 「映射是还原的唯一凭据」这类必须让用户看见的话。
+   用 --warn 而不是 --muted：它不是脚注，丢了就不可逆。 */
+.keep-note { margin: 10px 0 0; color: var(--warn); font-size: 13px; }
+
+.badge {
+  display: inline-block; min-width: 22px; text-align: center;
+  background: #eef1f5; border-radius: 9px; padding: 1px 8px;
+  font-size: 12px; color: var(--muted); font-weight: 600;
+}
+
+table { border-collapse: collapse; width: 100%; }
+.kv td { padding: 5px 0; vertical-align: top; }
+.kv td:first-child { width: 190px; color: var(--muted); }
+/* 表格里的长 URL 要能断行：不然「服务地址」那一行在窄屏下顶宽整页。 */
+.kv td { overflow-wrap: anywhere; }
+.kv code { background: #f1f3f6; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+
+.routes { margin: 0; padding-left: 18px; }
+.routes li { margin: 3px 0; font-size: 14px; }
+.routes .w { color: var(--accent); font-weight: 600; }
+.routes .r { color: var(--muted); }
+
+.scroll { max-height: 420px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.rules th, .rules td {
+  text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
+  font-size: 13.5px; vertical-align: top;
+}
+.rules th { background: #fafbfc; position: sticky; top: 0; font-weight: 600; }
+.rules td:first-child { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.rules td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.rules tr:last-child td { border-bottom: none; }
+
+/* ------------------------------------------------------------ 流程三步 */
+
+.steps {
+  display: flex; gap: 22px; margin: 0; padding: 0;
+  list-style: none; font-size: 14px; color: var(--muted);
+  /* 窄屏必须能折行。
+     不写这一句时，三步会被撑成一行（实测 527px），
+     于是整个页面在 420px 宽的屏上横向溢出 173px —— 步骤条把别的都顶没了。
+     flex 容器不设 flex-wrap 时默认不换行，而它的最小内容宽度
+     又会被这一行的三个项目撑大，父级 grid 跟着变宽。 */
+  flex-wrap: wrap;
+}
+.steps li::before { content: "○ "; }
+.steps li.on { color: var(--accent); font-weight: 600; }
+.steps li.on::before { content: "● "; }
+
+/* 文件输入框的宽度会跟着选中的文件名长起来（Chrome 的行为），
+   不封顶的话，一个长文件名就能把窄屏上的页面顶宽。 */
+.picker input[type=file] { font: inherit; max-width: 100%; }
+
+/* 口令输入框：不封顶宽度的话它会把整行撑开。
+   type=password 的框在窄屏上也不该超过 320px，否则一屏只剩这一个框。 */
+.passfield { margin: 12px 0 0; }
+.passfield label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.passfield input[type=password] {
+  font: inherit; font-size: 14px; padding: 6px 10px;
+  border: 1px solid var(--line); border-radius: 7px;
+  max-width: 320px; width: 100%;
+}
+.passfield p { margin: 6px 0 0; }
+
+/* 补充敏感词（人工补漏）。 */
+.terms { margin: 14px 0 0; padding-top: 12px; border-top: 1px dashed var(--line); }
+.terms label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.terms-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.terms-row input[type=text] {
+  font: inherit; font-size: 14px; padding: 6px 10px;
+  border: 1px solid var(--line); border-radius: 7px;
+  /* 不封顶宽度的话它会把整行撑开（同 .passfield 的理由）。 */
+  max-width: 320px; width: 100%;
+}
+.terms p { margin: 6px 0 0; }
+/* 已补的词：一眼能看出自己补了什么。 */
+.terms-list { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.terms-label { font-size: 12px; color: var(--muted); }
+.term-chip {
+  font-size: 12px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--accent); color: var(--accent);
+  background: #fff; word-break: break-all;
+}
+
+.bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+button, .primary {
+  font: inherit; font-size: 14px;
+  padding: 7px 16px; border-radius: 7px;
+  border: 1px solid var(--line); background: #fff; color: var(--ink);
+  cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.ghost { background: #fff; color: var(--muted); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button:not(:disabled):hover { filter: brightness(.97); }
+
+.summary { font-size: 14px; margin-bottom: 10px; }
+
+/* notes 是「必须让用户看到的话」，不是脚注：PDF 没文本层、签章被移除、
+   属性被清空……这些都会改变用户对成品的判断，样式要跟正文一样重。 */
+.notes {
+  border-left: 3px solid var(--warn); background: #fffdf5;
+  padding: 8px 12px; margin: 0 0 12px; font-size: 13.5px; color: #6b5200;
+  border-radius: 0 6px 6px 0;
+}
+.notes p { margin: 4px 0; }
+
+.error {
+  margin-top: 10px; padding: 8px 12px; font-size: 13.5px;
+  background: #fdf0ef; color: #a02a1c; border-left: 3px solid #c0392b;
+  border-radius: 0 6px 6px 0;
+}
+
+/* ---- 识别模型 ----
+   状态徽标用四种颜色，而不是「绿/非绿」两种：
+   「正在安装」与「已损坏」在两色方案里会撞成同一个颜色，
+   而这两件事要用户做的事完全相反（等 vs 重新装）。 */
+
+.model-card { border-left: 3px solid var(--line); }
+.model-card.ready { border-left-color: var(--ok); }
+.model-card.busy { border-left-color: var(--accent); }
+.model-card.warn { border-left-color: var(--warn); }
+.model-card.bad { border-left-color: #c0392b; }
+
+.model-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.model-msg { font-size: 14px; }
+
+.badge-state {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 600; white-space: nowrap;
+  background: #eef0f3; color: var(--muted);
+}
+.badge-state.ok { background: #e6f4ec; color: var(--ok); }
+.badge-state.busy { background: #e8f0fc; color: var(--accent); }
+.badge-state.warn { background: #fdf3e0; color: var(--warn); }
+.badge-state.bad { background: #fdf0ef; color: #a02a1c; }
+
+/* 未启用人名/机构名识别时的常驻提示。
+   它不是脚注：漏掉人名的文件会被用户直接传出去，
+   所以样式要与正文一样重，并且要一直挂在页面上。 */
+.banner {
+  border: 1px solid #f0d9a8; background: #fffaf0;
+  border-left: 4px solid var(--warn);
+  border-radius: 8px; padding: 12px 16px; margin: 0 0 16px;
+  color: #6b5200;
+}
+.banner-title { margin: 0 0 4px; font-weight: 600; font-size: 14.5px; }
+.banner-body { margin: 0 0 8px; font-size: 13.5px; }
+.banner-ack { display: flex; align-items: center; gap: 7px; font-size: 13.5px; cursor: pointer; }
+.banner-ack input { width: auto; margin: 0; }
+
+table.hits th, table.hits td {
+  text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
+  font-size: 13.5px; vertical-align: top;
+}
+table.hits th { background: #fafbfc; position: sticky; top: 0; font-weight: 600; }
+table.hits tr:last-child td { border-bottom: none; }
+table.hits td.pick, table.hits th.pick { width: 44px; text-align: center; }
+table.hits td.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* 「出现处」这一格：上面是次数，下面是位置。
+   位置要左对齐（它是一串文字，不是数字），字号小一号、颜色淡一点——
+   位置是给人核对用的辅助信息，不该跟「原值」抢注意力。 */
+table.hits td.num .locs {
+  text-align: left;
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  font-variant-numeric: normal;
+  font-weight: normal;
+  word-break: break-all;
+}
+table.hits td.num .locs .more { opacity: .75; }
+/* 折叠：默认只显示前几条位置，其余的要点「展开全部」才露出来。
+   折叠的是**显示**，不是「能不能选」——折叠起来的那几处照样挂勾选框，
+   也照样能被勾上（块 22）。 */
+table.hits td.num .locs .loc.locHidden { display: none; }
+table.hits td.num .locs.locsExpanded .loc.locHidden { display: flex; }
+table.hits td.num .locs button.locMore {
+  margin: 2px 0 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+table.hits td.num .locs button.locMore:hover { text-decoration: underline; }
+/* 逐处勾选（位置级排除）：每条位置前面挂一个「只保留这一处」的勾选框。
+   勾选框与位置文字之间留一点缝，视觉上要能看出它们是**一对**——
+   否则用户会以为那个框管的是整行。 */
+table.hits td.num .locs .loc {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+table.hits td.num .locs .loc input.occ-pick {
+  margin: 0;
+  flex: none;
+  cursor: pointer;
+}
+table.hits td.num .locs .loc input.occ-pick:disabled {
+  cursor: default;
+  opacity: .4;
+}
+table.hits td.num .locs .loc .locText { flex: 1 1 auto; }
+table.hits td.value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* 归组行：原文里紧挨着、被不同规则分别认领的几处命中合成了一行。
+   底色要看得见——用户第一眼就得知道「这一行不是普通的一行」。 */
+table.hits tr.merged td { background: #f3f7ff; }
+table.hits td.value .val { white-space: pre-wrap; word-break: break-all; }
+table.hits td.value .mergedTag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: #e3ecff;
+  color: #2b4a86;
+  font-family: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+}
+table.hits td.token { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); }
+
+/* ------------------------------------------------------------ 后台任务进度 */
+
+/* 进度条的槽。底色要浅：它是「正在忙」的提示，不是「出了错」的警告。 */
+.progress {
+  height: 8px; border-radius: 4px;
+  background: #e8ebf0;
+  overflow: hidden;
+  position: relative;
+}
+
+/* 已知总量时是一条按比例填充的实心条。 */
+.progress-fill {
+  height: 100%; width: 0;
+  background: var(--accent);
+  transition: width .25s ease;
+}
+
+/* 总量未知时（现在所有格式都是这样）走不确定态：
+   一段来回滑动的短条，而不是一根停在 0% 的死条。
+   一根不动但看着像在加载的进度条，会让人以为程序卡死了。 */
+.progress-fill.indeterminate {
+  width: 38%;
+  transition: none;
+  animation: progress-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(285%); }
+}
+
+/* 用户在系统里开了「减少动态效果」时，这条动画要停下来：
+   无限循环的动画对前庭功能障碍用户是真负担。 */
+@media (prefers-reduced-motion: reduce) {
+  .progress-fill.indeterminate {
+    animation: none;
+    width: 100%;
+    opacity: .45;
+  }
+}
+
+footer { padding: 8px 28px 26px; }

@@ -1,0 +1,9 @@
+{
+  "note": "内置信任锚：这里放**发布方自己的公钥**。程序只认在这里登记过的公钥签的模型包。格式：{\"keyId\": \"<标识>\", \"publicKey\": \"<SPKI DER 的 Base64>\"}。keyId 由公钥派生，写错了程序会直接报错（防「有人手改过这份清单」）。生成密钥用 tools/ModelPackageSigner.java keygen。",
+  "anchors": [
+    {
+      "keyId": "ed25519-1eae73de27c5",
+      "publicKey": "MCowBQYDK2VwAyEAOrVK8y5ebWF2qt5aqvsWrB90FKZYJPGLWUq1BAjTsDE="
+    }
+  ]
+}

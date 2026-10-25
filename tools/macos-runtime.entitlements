@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Java 应用的 hardened runtime 必备项（公证的硬性要求）。
+	  没有这三项，JVM 的 JIT 在 hardened runtime 下起不来，
+	  而错误信息是启动即崩的 UnsatisfiedLinkError / SIGKILL，离真因很远。
+	  - allow-jit：JVM 需要可执行内存来编译热点代码
+	  - allow-unsigned-executable-memory：部分 JDK 版本的 metaspace 需要
+	  - disable-library-validation：JVM 会 dlopen 自带的 dylib，
+	    而这些 dylib 若未签名或签名不一致，默认会被拒绝加载
+	-->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

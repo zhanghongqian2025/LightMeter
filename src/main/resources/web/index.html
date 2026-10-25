@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  令牌注入点。服务端在返回本页时把这个占位符替换成当次启动的随机会话令牌。
+  放在 meta 里而不是 URL 上：URL 会进浏览器历史记录，也可能从 Referer 泄给别的站。
+-->
+<meta name="litemask-token" content="__LITEMASK_TOKEN__">
+<title>文档脱敏 · 本地服务</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="dot" id="statusDot" title="服务状态"></span>
+    <h1>文档脱敏</h1>
+  </div>
+  <p class="sub" id="statusLine">正在连接本地服务…</p>
+</header>
+
+<main>
+  <!--
+    识别模型的状态。
+
+    【为什么它排在最前面】
+    模型没就绪时，人名与机构名**不会被脱敏**——那不是「少一个功能」，
+    是一份没脱干净的文档。而界面上「0 命中」与「文档干净」长得一模一样，
+    所以这件事必须比「选文件」更早让用户看见。
+
+    【为什么不展示命令行、堆栈或技术路径】
+    目标用户是普通人。`~/.litemask/models/ner`、`--ner-model`、
+    Ed25519 验签失败——这些对他没有意义，也没有条件照做。
+    照做不了的话，写出来只会让他卡在原地。
+    技术细节在日志文件里（`~/.litemask/logs/litemask.log`），不在界面上。
+  -->
+  <section class="card model-card" id="modelCard">
+    <h2>识别模型</h2>
+    <div class="model-head">
+      <span class="badge-state" id="modelStateBadge">检查中…</span>
+      <span class="model-msg" id="modelMessage">正在检查识别模型状态…</span>
+    </div>
+    <table class="kv" id="modelFacts"><tbody></tbody></table>
+    <div class="bar">
+      <button id="modelInstallBtn" class="primary" hidden>安装识别模型</button>
+      <button id="modelUpdateBtn" class="ghost" hidden>更新模型</button>
+      <button id="modelRollbackBtn" class="ghost" hidden>恢复上一版本</button>
+      <button id="modelImportBtn" class="ghost">选择离线模型包</button>
+      <input type="file" id="modelFile" accept=".zip" hidden>
+      <span class="muted small" id="modelHint">
+        离线模型包是一个文件，里面已经带着验证材料；选中它即可安装。
+      </span>
+    </div>
+    <div class="error" id="modelError" hidden></div>
+  </section>
+
+  <!--
+    未启用人名/机构名识别时的**常驻**提示。
+
+    【为什么要用户明确勾选】
+    规则识别模式仍然可用（身份证、手机号、银行卡这类有固定形态的东西照样脱），
+    但它**不能**替代人名与机构名识别。默认降级之后仍宣称「脱敏完成」，
+    是这个工具最不能犯的错——用户会把漏了人名的文件直接传出去。
+    → 所以这一态必须由用户明确认可，界面还得一直挂着这句话。
+  -->
+  <section class="banner warn" id="nerWarn" hidden>
+    <p class="banner-title">当前未启用人名与机构名识别，结果需要人工处理。</p>
+    <p class="banner-body">
+      本次只处理有固定格式的信息（身份证号、手机号、银行卡、邮箱等）。
+      <b>文档里的人名与机构名不会被脱敏</b>，需要你自己再核对一遍。
+    </p>
+    <label class="banner-ack">
+      <input type="checkbox" id="nerAck">
+      我已知晓本次结果需要人工处理，仍要继续
+    </label>
+  </section>
+
+  <!--
+    三步流程：选文件 → 挑要保留的命中 → 下载。
+    每一步都在上一步完成后才启用：状态由 app.js 的 step 字段统一推进，
+    不用一堆 hidden 属性各管各的（那种状态很容易在某条错误路径上对不上）。
+  -->
+  <section class="card">
+    <ol class="steps">
+      <li id="stepPick" class="on">1 · 选文件</li>
+      <li id="stepReview">2 · 挑要保留的命中</li>
+      <li id="stepDownload">3 · 下载</li>
+    </ol>
+  </section>
+
+  <!--
+    后台任务的进度与取消。
+
+    刻意放在流程最上面：长任务最缺的就是「现在到底在干什么」，
+    把它压在页面底部，用户只能盯着一个不动的按钮猜。
+
+    进度条<b>不报百分比</b>：各格式的文本单元总数事先算不出来
+    （PDF 按内容流、OOXML 按段落、OFD 按文本对象），
+    所以这里是一条不确定时长的进度条 + 「已处理 N 个文本单元」。
+    糊一个估算出来的百分比比说「不知道」更糟——用户会以为它可信。
+  -->
+  <section class="card pending" id="taskCard" hidden>
+    <h2 id="taskTitle">处理中</h2>
+    <div class="progress" id="progressTrack" role="progressbar" aria-label="处理进度">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <p class="muted small" id="progressText">准备中…</p>
+    <div class="bar">
+      <button id="cancelBtn" class="ghost">取消</button>
+      <span class="muted small" id="taskHint">
+        取消是协作式的：跑到下一个检查点才会停下，且不会留下任何文件。
+      </span>
+    </div>
+    <div class="error" id="taskError" hidden></div>
+  </section>
+
+  <section class="card" id="pickCard">
+    <h2>选择一个文件</h2>
+    <div class="picker">
+      <input type="file" id="file" accept=".docx,.xlsx,.pptx,.pdf,.ofd,.txt">
+      <p class="muted small">
+        支持 docx / xlsx / pptx / pdf / ofd / txt，单个文件最大 256 MB。
+        文件只在 127.0.0.1 上处理，不上传到任何地方。
+      </p>
+    </div>
+    <div class="bar">
+      <button id="scanBtn" class="primary" disabled>开始扫描</button>
+      <span class="muted small" id="scanHint">先选一个文件</span>
+    </div>
+    <div class="error" id="scanError" hidden></div>
+  </section>
+
+  <!--
+    命中清单。服务端回来的每一项都有 ruleKey / original / token / occurrences / locators，
+    其中 locators 的第 i 条就是「第 i 次出现」——与引擎的编号口径一致。
+    所以复选框发回去时带上 occurrence 索引，就能精确到「只保留这一处」。
+
+    「出现处」那一列显示的是**次数 + 位置**：位置以前只下发、从不显示，
+    清单上写着「出现 3 次」而用户不知道这 3 次分别在哪，
+    这份清单就没法用来核对——位置信息不下发等于没有。
+  -->
+  <section class="card" id="reviewCard" hidden>
+    <h2>命中清单</h2>
+    <div class="summary" id="summary"></div>
+    <div class="notes" id="notes" hidden></div>
+    <div class="scroll">
+      <table class="hits">
+        <thead>
+          <tr>
+            <th class="pick">保留</th>
+            <th>原值</th>
+            <th>规则</th>
+            <th>出现处</th>
+            <th>文档中写入</th>
+          </tr>
+        </thead>
+        <tbody id="hitBody"></tbody>
+      </table>
+    </div>
+    <p class="muted small" id="locatorHint"></p>
+    <!--
+      补充敏感词（人工补漏）。
+
+      【为什么要有这个入口】本工具的内置规则只认**有固定形态**的东西
+      （身份证、银行卡、手机号…）。但卷宗里有大量**没有固定形态**的敏感信息：
+      某个当事人名字、某个案号、内部代号。规则认不出来 → 清单上零命中 →
+      而那些字**明明白白就在文档里**。
+      过去界面上只能「排除误报」，做不了「补上漏检」—— 人工复核只剩一半。
+
+      【补的词会去哪】接进**现有引擎**重扫一遍：它会出现在下面的命中清单里，
+      你能看见它、也能勾掉它（那可能是个误伤），最后它进映射、能还原。
+      走引擎才有这些；另开一条旁路的话，令牌编号对不上、还原不回去。
+
+      【只对本次处理有效】它不是全局规则，也不会影响下一份文件。
+    -->
+    <div class="terms" id="termsBox">
+      <label for="termInput">补充敏感词（规则认不出来的那些）</label>
+      <div class="terms-row">
+        <input type="text" id="termInput" placeholder="例如：李某" spellcheck="false"
+               autocomplete="off">
+        <button id="termAdd" class="ghost">加入并重扫</button>
+      </div>
+      <p class="muted small">
+        一次可以写多个，用逗号或换行分开。补的词会出现在上面的清单里，
+        你仍然可以勾掉它。<b>只对这一份文件有效</b>。
+      </p>
+      <p class="terms-list" id="termList" hidden></p>
+      <div class="error" id="termError" hidden></div>
+    </div>
+    <!--
+      映射文件口令（可选）。
+
+      【为什么放在这一卡里】映射件是在「生成脱敏文件」那一步产出的，
+      口令必须在这一步一起给——事后补不了（映射件已经落盘了）。
+
+      【为什么是可选的】没填口令时的行为与从前完全一样（写明文映射件）：
+      不给口令的用户不该被静默改掉流程。填了则映射件被加密，文件里没有原值。
+    -->
+    <div class="passfield">
+      <label for="mapPass">映射文件口令（可选）</label>
+      <input type="password" id="mapPass" autocomplete="new-password" spellcheck="false"
+             placeholder="留空则不加密">
+      <p class="muted small">
+        填了口令，下载的映射文件会被加密（<b>文件里没有原文</b>），还原时要用同一个口令；
+        <b>留空则不加密</b>，映射文件里会有原文。
+      </p>
+    </div>
+    <div class="bar">
+      <button id="allBtn" class="ghost">全部保留</button>
+      <button id="noneBtn" class="ghost">全部脱敏</button>
+      <button id="applyBtn" class="primary">生成脱敏文件</button>
+      <span class="muted small" id="choiceHint"></span>
+    </div>
+    <div class="error" id="applyError" hidden></div>
+  </section>
+
+  <section class="card" id="downloadCard" hidden>
+    <h2>完成</h2>
+    <div class="summary" id="doneSummary"></div>
+    <div class="notes" id="doneNotes" hidden></div>
+    <div class="bar">
+      <!--
+        用 button 而不是 <a download>：下载接口要带令牌自定义头，
+        而导航请求带不上。脚本走 fetch + Blob 下载。
+      -->
+      <button id="downloadBtn" class="primary">下载脱敏文件</button>
+      <button id="mappingBtn" class="ghost">下载映射文件</button>
+      <button id="restoreBtn" class="ghost">还原并下载</button>
+      <button id="againBtn" class="ghost">再处理一个文件</button>
+    </div>
+    <!--
+      映射是还原的唯一凭据。脱敏件里只有令牌、没有原值，
+      映射丢了就再也还原不回来——这句话必须让用户看见，
+      不能指望他自己知道。
+    -->
+    <p class="keep-note" id="keepNote">
+      映射文件是还原的唯一凭据：脱敏件里只有令牌，没有原值。请把映射文件与脱敏件一起保存。
+    </p>
+    <!--
+      映射件被加密时才出现。这一句不能省：用户若以为自己拿到的是明文映射件，
+      就会把它当成「随手传给别人也没事」的东西——而它装着全部原值。
+    -->
+    <p class="keep-note" id="sealedNote" hidden>
+      映射文件已用口令加密（<b>文件里没有原文</b>）。还原时需要同一个口令：
+      命令行 <code>restore --map &lt;映射文件&gt; --map-pass-env &lt;变量&gt;</code>。
+    </p>
+    <p class="muted small" id="restoreHint">
+      还原的是<b>文本内容</b>：文档属性清空、签章移除、数值单元格转文本这些动作不可逆，
+      还原件与原件在文本上一致，但不是同一个文件。
+    </p>
+    <div class="error" id="restoreError" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>访问控制姿态</h2>
+    <table class="kv" id="posture"><tbody></tbody></table>
+    <p class="muted small">
+      外部网页可以对本机发请求，但读不到响应（同源策略），也构造不出带令牌的写请求
+      （自定义头会触发预检，本服务不答预检）。这两条是本服务对外部网页的全部防护面。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>接口</h2>
+    <ul class="routes" id="routes"></ul>
+  </section>
+
+  <section class="card">
+    <h2>规则库 <span class="badge" id="ruleCount">–</span></h2>
+    <div class="scroll">
+      <table class="rules">
+        <thead>
+          <tr><th>键</th><th>名称</th><th>占位前缀</th><th>优先级</th><th>校验器</th><th>判定说明</th></tr>
+        </thead>
+        <tbody id="ruleBody"></tbody>
+      </table>
+    </div>
+    <p class="muted small">
+      「正则」一列刻意不在页面上铺开：判断误报要看的是判定说明，正则本身贴出来反而更难读。
+    </p>
+  </section>
+</main>
+
+<footer class="muted small">
+  文档内容不出本机。页面与接口都只监听 127.0.0.1。
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
