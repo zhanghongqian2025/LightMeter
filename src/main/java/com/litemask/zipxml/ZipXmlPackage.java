@@ -268,6 +268,9 @@ public final class ZipXmlPackage {
                 XMLInputFactory factory = XMLInputFactory.newInstance();
                 factory.setProperty(XMLInputFactory.SUPPORT_DTD, Boolean.FALSE);
                 factory.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, Boolean.FALSE);
+                // 新版 JDK 自带 StAX 还有一层较低的默认深度闸门。让它比产品闸门多一层，
+                // 才能由下面这条稳定、可解释的限制先报出“嵌套深度”，而不是泛化成解析失败。
+                factory.setProperty("jdk.xml.maxElementDepth", limits.maxXmlDepth() + 1);
                 reader = factory.createXMLStreamReader(new ByteArrayInputStream(xml));
                 int depth = 0;
                 while (reader.hasNext()) {
