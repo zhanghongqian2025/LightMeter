@@ -272,10 +272,13 @@ public final class TaskRunner implements AutoCloseable {
             if (t.timedOut) {
                 continue;
             }
-            t.timedOut = true;
-            t.cancelRequested = true;
-            timedOutCount.incrementAndGet();
-            t.context.cancel();
+            synchronized (t) {
+                if (t.status == Status.RUNNING && t.context.requestCancel()) {
+                    t.timedOut = true;
+                    t.cancelRequested = true;
+                    timedOutCount.incrementAndGet();
+                }
+            }
         }
     }
 
@@ -407,14 +410,16 @@ public final class TaskRunner implements AutoCloseable {
             task.status = Status.DONE;
             task.message = "扫描完成";
         } catch (TaskContext.CanceledException e) {
-            task.status = task.timedOut ? Status.TIMED_OUT : Status.CANCELED;
-            task.message = task.timedOut
-                    ? "超过时限被自动中止，没有产出任何文件"
-                    : "已取消，没有产出任何文件";
-            // 原因也要落到 error 上：界面失败分支读的是 error，
-            // 只写 message 的话，超时会被显示成「任务失败」——
-            // 那是在跟用户说假话（他们会以为是自己弄坏的，或者服务崩了）。
-            task.error = task.message;
+            synchronized (task) {
+                task.status = task.timedOut ? Status.TIMED_OUT : Status.CANCELED;
+                task.message = task.timedOut
+                        ? "超过时限被自动中止，没有产出任何文件"
+                        : "已取消，没有产出任何文件";
+                // 原因也要落到 error 上：界面失败分支读的是 error，
+                // 只写 message 的话，超时会被显示成「任务失败」——
+                // 那是在跟用户说假话（他们会以为是自己弄坏的，或者服务崩了）。
+                task.error = task.message;
+            }
         } catch (Exception e) {
             task.status = Status.FAILED;
             task.error = describeFailure(e);
@@ -438,12 +443,14 @@ public final class TaskRunner implements AutoCloseable {
             task.status = Status.DONE;
             task.message = "应用完成";
         } catch (TaskContext.CanceledException e) {
-            task.status = task.timedOut ? Status.TIMED_OUT : Status.CANCELED;
-            task.message = task.timedOut
-                    ? "超过时限被自动中止，没有产出任何文件"
-                    : "已取消，没有产出任何文件";
-            // 原因也要落到 error 上：界面失败分支读的是 error。
-            task.error = task.message;
+            synchronized (task) {
+                task.status = task.timedOut ? Status.TIMED_OUT : Status.CANCELED;
+                task.message = task.timedOut
+                        ? "超过时限被自动中止，没有产出任何文件"
+                        : "已取消，没有产出任何文件";
+                // 原因也要落到 error 上：界面失败分支读的是 error。
+                task.error = task.message;
+            }
         } catch (JobStore.BadRequestException e) {
             task.status = Status.FAILED;
             task.error = e.getMessage();
@@ -493,10 +500,13 @@ public final class TaskRunner implements AutoCloseable {
         if (task == null) {
             return false;
         }
-        task.cancelRequested = true;
         // 已经跑完的任务不用取消：它有结果，取消它等于把一份做完的活扔掉。
-        if (task.status == Status.RUNNING) {
-            task.context.cancel();
+        synchronized (task) {
+            if (task.status == Status.RUNNING) {
+                if (task.context.requestCancel()) {
+                    task.cancelRequested = true;
+                }
+            }
         }
         return true;
     }

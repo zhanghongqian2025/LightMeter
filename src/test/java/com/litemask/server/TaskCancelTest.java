@@ -108,6 +108,17 @@ class TaskCancelTest {
 
     // ------------------------------------------------------------ 取消不留痕
 
+    @Test
+    @DisplayName("同一上下文只有第一个取消请求能赢得线性化边界")
+    void 重复取消只有第一次成功() {
+        TaskContext ctx = TaskContext.create(null);
+
+        assertTrue(ctx.requestCancel(), "第一次取消应当生效");
+        assertFalse(ctx.requestCancel(),
+                "后来的超时或重复点击不能夺走已记录的取消原因");
+        assertTrue(ctx.isCancelled());
+    }
+
     /**
      * 取消之后：没有作业、没有文件。
      *
@@ -266,8 +277,12 @@ class TaskCancelTest {
                     ("联系电话 " + PHONE + "\n").getBytes(StandardCharsets.UTF_8));
             TaskRunner.Task 终 = 等到终态(runner, t);
             assertEquals(TaskRunner.Status.DONE, 终.status());
+            assertFalse(终.context.requestCancel(),
+                    "结果提交已经赢得线性化边界，晚到的取消不能再宣称成功");
 
             assertTrue(runner.cancel(t.taskId()), "任务存在，所以取消请求被受理");
+            assertFalse(终.cancelRequested,
+                    "兼容的 true 只表示任务存在，不能把已提交任务标成取消中");
             assertEquals(TaskRunner.Status.DONE, 终.status(),
                     "已跑完的任务不能被改成 canceled：磁盘上明明有一份成品");
         } finally {

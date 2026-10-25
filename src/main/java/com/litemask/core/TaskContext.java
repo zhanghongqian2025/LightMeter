@@ -1,7 +1,6 @@
 package com.litemask.core;
 
 import java.io.IOException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 一次脱敏运行的「可取消 + 可报进度」作用域。
@@ -27,11 +26,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class TaskContext {
 
     /** 不报进度、也不可取消的上下文。CLI 与同步调用走这个。 */
-    public static final TaskContext NONE = new TaskContext(null);
+    public static final TaskContext NONE = new TaskContext(null, false);
 
     private static final ThreadLocal<TaskContext> CURRENT = new ThreadLocal<>();
 
-    private final AtomicBoolean cancelled = new AtomicBoolean(false);
+    private final Object commitLock = new Object();
+    private final boolean cancelable;
+    private volatile boolean cancelled;
+    private boolean committed;
     private final ProgressListener listener;
 
     /**
@@ -47,27 +49,65 @@ public final class TaskContext {
         void onProgress(String phase, int done, int total);
     }
 
-    private TaskContext(ProgressListener listener) {
+    private TaskContext(ProgressListener listener, boolean cancelable) {
         this.listener = listener;
+        this.cancelable = cancelable;
     }
 
     /** 造一个可取消、可报进度的上下文。 */
     public static TaskContext create(ProgressListener listener) {
-        return new TaskContext(listener);
+        return new TaskContext(listener, true);
     }
 
     /** 请求取消。已在运行的那一段会跑到下一个检查点才停。 */
     public void cancel() {
-        cancelled.set(true);
+        requestCancel();
+    }
+
+    /**
+     * 请求取消，并与最终结果提交共用同一把锁。
+     *
+     * @return 提交尚未发生、取消请求已生效时为 true；结果已经提交时为 false
+     */
+    public boolean requestCancel() {
+        if (!cancelable) {
+            return false;
+        }
+        synchronized (commitLock) {
+            if (committed || cancelled) {
+                return false;
+            }
+            cancelled = true;
+            return true;
+        }
+    }
+
+    /**
+     * 在线性化边界内发布最终结果。取消先赢则不执行 publication；提交先赢则后续取消失败。
+     */
+    public boolean tryCommit(Runnable publication) {
+        java.util.Objects.requireNonNull(publication, "publication");
+        if (!cancelable) {
+            publication.run();
+            return true;
+        }
+        synchronized (commitLock) {
+            if (cancelled) {
+                return false;
+            }
+            publication.run();
+            committed = true;
+            return true;
+        }
     }
 
     public boolean isCancelled() {
-        return cancelled.get();
+        return cancelled;
     }
 
     /** 取消了就抛。这是控制流异常，不是错误。 */
     public void checkCancelled() {
-        if (cancelled.get()) {
+        if (cancelled) {
             throw new CanceledException();
         }
     }

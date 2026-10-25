@@ -409,8 +409,14 @@ public final class JobStore {
             Job job = new Job(UUID.randomUUID().toString().replace("-", ""),
                     stored.diskName(), previewName, stored.displayName(),
                     stored.extension(), format, result, identity);
-            synchronized (this) {
-                jobs.put(job.jobId, job);
+            TaskContext scanContext = ctx == null ? TaskContext.NONE : ctx;
+            boolean committed = scanContext.tryCommit(() -> {
+                synchronized (JobStore.this) {
+                    jobs.put(job.jobId, job);
+                }
+            });
+            if (!committed) {
+                throw new TaskContext.CanceledException();
             }
             return job;
         } catch (RuntimeException | IOException e) {
@@ -744,7 +750,20 @@ public final class JobStore {
         try {
             TaskContext.current().checkCancelled();
             mapping = writeMapping(job, applied, appliedIdentity, passphrase);
-            TaskContext.current().checkCancelled();
+            MappingArtifact readyMapping = mapping;
+            boolean committed = TaskContext.current().tryCommit(() -> {
+                // 成品和映射都已安全落盘后，才在线性化边界内发布可下载状态。
+                job.applied = applied;
+                job.appliedIdentity = appliedIdentity;
+                job.appliedRevision = reviewed.revision();
+                job.mappingName = readyMapping.name();
+                job.mappingSealed = readyMapping.sealed();
+                // outputName 是所有下载/重试路径的发布标志，必须最后写。
+                job.outputName = outputName;
+            });
+            if (!committed) {
+                throw new TaskContext.CanceledException();
+            }
         } catch (RuntimeException | IOException e) {
             if (mapping != null) {
                 workspace.delete(mapping.name());
@@ -754,14 +773,6 @@ public final class JobStore {
             }
             throw e;
         }
-        // 成品和映射都已安全落盘后，才一次性发布可下载状态。
-        job.applied = applied;
-        job.appliedIdentity = appliedIdentity;
-        job.appliedRevision = reviewed.revision();
-        job.mappingName = mapping.name();
-        job.mappingSealed = mapping.sealed();
-        // outputName 是所有下载/重试路径的发布标志，必须最后写。
-        job.outputName = outputName;
         return job;
     }
 

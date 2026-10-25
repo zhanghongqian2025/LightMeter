@@ -15,9 +15,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -70,26 +75,43 @@ class JobStoreApplyTransactionTest {
 
     @Test
     void cancellationAfterMappingWriteDeletesMapPreservesPreviewAndAllowsRetry() throws Exception {
-        AtomicReference<TaskContext> context = new AtomicReference<>();
         AtomicBoolean firstWrite = new AtomicBoolean(true);
+        CountDownLatch mappingWritten = new CountDownLatch(1);
+        CountDownLatch releaseCommit = new CountDownLatch(1);
         JobStore.MappingWriter cancelAfterWrite = (path, content) -> {
             PrivateFile.write(path, content);
             if (firstWrite.getAndSet(false)) {
-                context.get().cancel();
+                mappingWritten.countDown();
+                try {
+                    if (!releaseCommit.await(5, TimeUnit.SECONDS)) {
+                        throw new IOException("timed out waiting to release commit boundary");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted waiting to release commit boundary", e);
+                }
             }
         };
 
-        try (Workspace ws = Workspace.open(tmp.resolve("cancel-after-map"))) {
+        try (Workspace ws = Workspace.open(tmp.resolve("cancel-after-map"));
+             ExecutorService pool = Executors.newSingleThreadExecutor()) {
             JobStore jobs = new JobStore(ws, ApiHandlers.defaultRules(), List.of(),
                     com.litemask.core.ExclusiveGate.NONE, null, cancelAfterWrite);
             JobStore.Job job = jobs.scan("case.txt",
                     "电话13800138000。".getBytes(StandardCharsets.UTF_8));
             long filesBeforeApply = fileCount(ws.sessionDir());
             TaskContext ctx = TaskContext.create(null);
-            context.set(ctx);
 
-            assertThrows(TaskContext.CanceledException.class,
+            Future<JobStore.Job> applying = pool.submit(
                     () -> jobs.applyCancellable(job.jobId(), Exclusions.NONE, ctx));
+            assertTrue(mappingWritten.await(5, TimeUnit.SECONDS),
+                    "应用任务应停在映射落盘后、最终发布前");
+            assertTrue(ctx.requestCancel(), "最终发布尚未提交时，取消必须赢得线性化边界");
+            releaseCommit.countDown();
+
+            ExecutionException canceled = assertThrows(ExecutionException.class,
+                    () -> applying.get(5, TimeUnit.SECONDS));
+            assertTrue(canceled.getCause() instanceof TaskContext.CanceledException);
             assertNull(job.outputNameForTest());
             assertNull(job.mappingNameForTest());
             assertNull(job.applied);
