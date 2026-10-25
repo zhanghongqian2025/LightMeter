@@ -190,7 +190,8 @@ public final class JobStore {
             boolean nerEnabled) {
             this(jobId, sourceName, previewName, displayName, extension, format, scan,
                     new ProcessingIdentity(ToolIdentity.version(), ToolIdentity.artifactSha256(),
-                            nerEnabled, null, null, null, null, false));
+                            nerEnabled, nerEnabled ? "unverified-entity-source" : null,
+                            null, null, null, false));
         }
 
         Job(String jobId, String sourceName, String previewName, String displayName,
@@ -494,7 +495,20 @@ public final class JobStore {
         }
         boolean usedModel = nerParticipated();
         return new ProcessingIdentity(ToolIdentity.version(), ToolIdentity.artifactSha256(),
-                usedModel, null, null, null, null, false);
+                usedModel, usedModel ? unverifiedSourceId() : null,
+                null, null, null, false);
+    }
+
+    private String unverifiedSourceId() {
+        String names = sources.stream()
+                .filter(com.litemask.core.EntitySource::isActive)
+                .map(com.litemask.core.EntitySource::name)
+                .filter(name -> name != null && !name.isBlank())
+                .map(String::trim)
+                .sorted()
+                .distinct()
+                .collect(java.util.stream.Collectors.joining("+"));
+        return names.isEmpty() ? "unverified-entity-source" : "unverified-source:" + names;
     }
 
     /**

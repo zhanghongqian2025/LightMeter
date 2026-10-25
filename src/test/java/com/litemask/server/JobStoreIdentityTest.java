@@ -91,6 +91,8 @@ class JobStoreIdentityTest {
                 "1.1.4", "not-a-digest", false, null, null, null, null, false));
         assertThrows(IllegalArgumentException.class, () -> new ProcessingIdentity(
                 "1.1.4", TOOL_SHA, true, "model", "version", null, "key", true));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessingIdentity(
+                "1.1.4", TOOL_SHA, true, "  ", null, null, null, false));
         ProcessingIdentity noModel = ProcessingIdentity.withoutModel();
         assertFalse(noModel.usedModel());
         assertFalse(noModel.signatureVerified());

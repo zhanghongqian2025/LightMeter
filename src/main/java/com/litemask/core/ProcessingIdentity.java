@@ -21,6 +21,9 @@ public record ProcessingIdentity(
         toolVersion = toolVersion == null || toolVersion.isBlank() ? "未知" : toolVersion;
         requireDigestShape("toolArtifactSha256", toolArtifactSha256);
         requireDigestShape("modelPackageSha256", modelPackageSha256);
+        if (usedModel && (modelId == null || modelId.isBlank())) {
+            throw new IllegalArgumentException("使用模型时必须带非空 modelId");
+        }
         if (!usedModel && (modelId != null || modelVersionKey != null || modelPackageSha256 != null
                 || modelSigningKeyId != null || signatureVerified)) {
             throw new IllegalArgumentException("未使用模型时不能声明模型身份或验签状态");

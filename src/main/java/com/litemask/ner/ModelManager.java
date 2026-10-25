@@ -561,13 +561,13 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
             if (!usedModel) {
                 return ProcessingIdentity.withoutModel();
             }
-            NerModelPackage.Manifest manifest = manifestOf(current);
+            NerModelPackage.Manifest manifest = requireManifestOf(current);
             ModelPackageStore.Provenance provenance = activeProvenance;
             return new ProcessingIdentity(
                     ToolIdentity.version(),
                     ToolIdentity.artifactSha256(),
                     true,
-                    manifest == null ? null : manifest.id(),
+                    manifest.id(),
                     provenance == null ? null : provenance.versionKey(),
                     provenance == null ? null : provenance.packageSha256(),
                     provenance == null ? null : provenance.signingKeyId(),
@@ -844,6 +844,22 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
             return pkg == null ? null : pkg.manifest();
         } catch (RuntimeException e) {
             return null;
+        }
+    }
+
+    /** 推理已启用时，清单与其稳定 id 都是处理身份的必需组成，缺失必须停止扫描。 */
+    static NerModelPackage.Manifest requireManifestOf(NerModelRegistry r) {
+        try {
+            NerModelPackage pkg = NerModelRegistry.packageOf(r);
+            NerModelPackage.Manifest manifest = pkg == null ? null : pkg.manifest();
+            if (manifest == null || manifest.id() == null || manifest.id().isBlank()) {
+                throw new IllegalStateException("已启用模型缺少有效清单或非空 modelId，拒绝生成处理身份");
+            }
+            return manifest;
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("读取已启用模型清单失败，拒绝生成处理身份", e);
         }
     }
 

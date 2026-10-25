@@ -19,6 +19,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -37,6 +38,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 验签这一步<b>是真的</b>，只是「发布方」换成了测试自己。
  */
 class ModelManagerTest {
+
+    @Test
+    @DisplayName("启用状态缺少模型包清单时处理身份明确失败")
+    void 缺清单不再降级成空模型身份() {
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> ModelManager.requireManifestOf(null));
+        assertTrue(failure.getMessage().contains("缺少有效清单"));
+    }
 
     /** 一次性把内置信任锚换成测试自己的那把公钥。 */
     private static void 用测试信任锚(Path anchorsFile, KeyPair kp) throws IOException {
