@@ -386,36 +386,41 @@ public final class JobStore {
                 evictOldest();
             }
         }
-        DocumentService.Format format;
+        String previewName = null;
         try {
-            format = DocumentService.Format.of(stored.extension());
-        } catch (DocumentService.UnsupportedFormatException e) {
-            throw new BadRequestException(e.getMessage());
-        }
+            DocumentService.Format format;
+            try {
+                format = DocumentService.Format.of(stored.extension());
+            } catch (DocumentService.UnsupportedFormatException e) {
+                throw new BadRequestException(e.getMessage());
+            }
 
-        String previewName = workspace.newDiskName(stored.extension());
-        DocumentService.Result result;
-        ProcessingIdentity identity;
-        try (com.litemask.core.ExclusiveGate.Release release = gate.acquire()) {
-            identity = captureIdentity();
-            result = TaskContext.in(ctx, () -> DocumentService.redact(
-                    workspace.pathOf(stored.diskName()), workspace.pathOf(previewName),
-                    format, rules, Exclusions.NONE, sources));
-        } catch (TaskContext.CanceledException e) {
-            // 取消：原件与半成品预览件都必须清掉。
-            // 留着它们等于把用户的原文档留在磁盘上，而界面上已经看不见它了。
+            previewName = workspace.newDiskName(stored.extension());
+            DocumentService.Result result;
+            ProcessingIdentity identity;
+            String finalPreviewName = previewName;
+            try (com.litemask.core.ExclusiveGate.Release release = gate.acquire()) {
+                identity = captureIdentity();
+                result = TaskContext.in(ctx, () -> DocumentService.redact(
+                        workspace.pathOf(stored.diskName()), workspace.pathOf(finalPreviewName),
+                        format, rules, Exclusions.NONE, sources));
+            }
+
+            Job job = new Job(UUID.randomUUID().toString().replace("-", ""),
+                    stored.diskName(), previewName, stored.displayName(),
+                    stored.extension(), format, result, identity);
+            synchronized (this) {
+                jobs.put(job.jobId, job);
+            }
+            return job;
+        } catch (RuntimeException | IOException e) {
+            // 登记成 job 之前的任何失败都没有后续生命周期接管，原件和半成品必须清掉。
             workspace.delete(stored.diskName());
-            workspace.delete(previewName);
+            if (previewName != null) {
+                workspace.delete(previewName);
+            }
             throw e;
         }
-
-        Job job = new Job(UUID.randomUUID().toString().replace("-", ""),
-                stored.diskName(), previewName, stored.displayName(),
-                stored.extension(), format, result, identity);
-        synchronized (this) {
-            jobs.put(job.jobId, job);
-        }
-        return job;
     }
 
     // ----------------------------------------------------------------- 补充敏感词

@@ -13,6 +13,7 @@ import com.litemask.core.ProcessingIdentity;
 import com.litemask.core.RuleLoader;
 import com.litemask.core.ToolIdentity;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,23 @@ class JobStoreIdentityTest {
 
     @TempDir
     Path tmp;
+
+    @Test
+    @DisplayName("身份提供器失败时清掉尚未登记的原件与预览")
+    void identityProviderFailureLeavesNoUnownedFiles() throws Exception {
+        try (Workspace ws = Workspace.open(tmp.resolve("identity-failure"))) {
+            JobStore jobs = new JobStore(ws, RuleLoader.loadFromClasspath("rules/core-rules.json"),
+                    List.of(), com.litemask.core.ExclusiveGate.NONE,
+                    () -> { throw new IllegalStateException("missing manifest"); });
+
+            assertThrows(IllegalStateException.class, () -> jobs.scan("case.txt", sample()));
+            assertEquals(0, jobs.size());
+            try (var files = Files.list(ws.sessionDir())) {
+                assertEquals(0, files.filter(Files::isRegularFile).count(),
+                        "身份捕获失败后不能留下无人接管的原件或预览");
+            }
+        }
+    }
 
     @Test
     @DisplayName("旧扫描身份不随当前模型变化；重扫与应用绑定实际使用的那一版")
