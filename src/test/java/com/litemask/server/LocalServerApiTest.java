@@ -14,6 +14,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.Proxy;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -133,7 +134,10 @@ class LocalServerApiTest {
             System.out.println("跳过：没有可用的局域网地址");
             return;
         }
-        try (Socket s = new Socket()) {
+        // 必须绕开系统 SOCKS 代理：new Socket() 会继承 JVM 的代理设置，
+        // 代理进程可以先接住任意目标地址，让 connect() 假成功，实际并没有
+        // 从局域网地址连到本服务。这里测的是内核绑定，不是代理可达性。
+        try (Socket s = new Socket(Proxy.NO_PROXY)) {
             s.connect(new InetSocketAddress(lanIp, port), 1500);
             // 连上了就是问题本身。用 fail 让它红，而不是打个日志。
             org.junit.jupiter.api.Assertions.fail(
@@ -285,7 +289,12 @@ class LocalServerApiTest {
         assertTrue(r.body.contains("GET /api/health [读]"), r.body);
     }
 
-    /** 本机第一个非回环 IPv4；没有就返回 null（由调用方跳过）。 */
+    /**
+     * 本机第一个 RFC 1918 站点本地 IPv4；没有就返回 null（由调用方跳过）。
+     *
+     * <p>不能只排除 127/8：macOS 可能同时持有 169.254/16 链路本地地址，
+     * 该地址属于本机并走 LOCAL 路由，不能代表普通局域网客户端。
+     */
     private static String 本机局域网地址() {
         try {
             for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
@@ -293,11 +302,11 @@ class LocalServerApiTest {
                     continue;
                 }
                 for (InetAddress a : Collections.list(ni.getInetAddresses())) {
-                    if (a.isLoopbackAddress() || a instanceof java.net.Inet6Address) {
+                    if (a instanceof java.net.Inet6Address || !a.isSiteLocalAddress()) {
                         continue;
                     }
                     String ip = a.getHostAddress();
-                    if (ip != null && !ip.startsWith("127.")) {
+                    if (ip != null) {
                         return ip;
                     }
                 }

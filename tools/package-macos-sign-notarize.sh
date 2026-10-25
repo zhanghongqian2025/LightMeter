@@ -97,10 +97,15 @@ fi
 # ---------------------------------------------------------------- 2. inside-out 签名
 echo ""
 echo "== 2. inside-out 签名 =="
-HARDENED=()
-if [ "$IDENTITY" != "-" ]; then
-  HARDENED=(--options runtime --timestamp)
-fi
+sign_code() {
+  # macOS 自带 Bash 3.2 在 `set -u` 下展开空数组会报 unbound variable，
+  # 所以不要用空的 HARDENED 数组来表达 ad-hoc 分支。
+  if [ "$IDENTITY" != "-" ]; then
+    codesign --force --sign "$IDENTITY" --options runtime --timestamp "$@"
+  else
+    codesign --force --sign "$IDENTITY" "$@"
+  fi
+}
 if [ -f "$ENTITLEMENTS" ]; then
   note "使用 entitlements：$ENTITLEMENTS"
 else
@@ -121,9 +126,9 @@ COUNT=0
 while IFS= read -r item; do
   [ "$item" = "$APP" ] && continue
   case "$item" in
-    *"/_CodeSignature/"*|*"/CodeResources") continue ;;
+    */_CodeSignature/*|*/CodeResources) continue ;;
   esac
-  if codesign --force --sign "$IDENTITY" "${HARDENED[@]}" "$item" 2>>"$REPORT.log"; then
+  if sign_code "$item" 2>>"$REPORT.log"; then
     COUNT=$((COUNT + 1))
   else
     bad "嵌套签名失败：${item#$APP/}"
@@ -131,9 +136,11 @@ while IFS= read -r item; do
   fi
 done < <(
   find "$APP" -type f 2>/dev/null | sort | while IFS= read -r f; do
-    case "$f" in
-      *"/_CodeSignature/"*) continue ;;
-    esac
+    # macOS 自带 Bash 3.2 会把 process substitution 里的 case 模式末尾 `*)`
+    # 误判成 `< <(...)` 的结束符并在 continue 处报语法错；[[ ]] 没有该歧义。
+    if [[ "$f" == */_CodeSignature/* ]]; then
+      continue
+    fi
     if file -b "$f" 2>/dev/null | grep -q 'Mach-O'; then printf '%s\n' "$f"; fi
   done
   # 嵌套 bundle（.framework / .app / .bundle）本身也要签，且要排在里面的文件之后
@@ -141,7 +148,12 @@ done < <(
 )
 note "已签嵌套项：$COUNT"
 
-if codesign --force --sign "$IDENTITY" "${HARDENED[@]}" ${ENTITLEMENTS:+--entitlements "$ENTITLEMENTS"} "$APP" 2>>"$REPORT.log"; then
+if [ -f "$ENTITLEMENTS" ]; then
+  APP_SIGN_ARGS=(--entitlements "$ENTITLEMENTS" "$APP")
+else
+  APP_SIGN_ARGS=("$APP")
+fi
+if sign_code "${APP_SIGN_ARGS[@]}" 2>>"$REPORT.log"; then
   ok "应用签名完成"
 else
   bad "应用签名失败"
@@ -169,7 +181,7 @@ cp -R "$APP" "$OUT/pkgroot/"
 if [ -n "$INSTALLER_IDENTITY" ]; then
   if pkgbuild --root "$OUT/pkgroot" --install-location /Applications \
       --identifier "$PKG_IDENTIFIER" --sign "$INSTALLER_IDENTITY" "$PKG" 2>>"$REPORT.log"; then
-    ok "已签 .pkg：$PKG（标识符 $PKG_IDENTIFIER）"
+    ok "已签 .pkg：${PKG}（标识符 ${PKG_IDENTIFIER}）"
   else
     bad "pkgbuild 失败"
     sed 's/^/      /' "$REPORT.log" | tail -10
@@ -177,7 +189,7 @@ if [ -n "$INSTALLER_IDENTITY" ]; then
 else
   if pkgbuild --root "$OUT/pkgroot" --install-location /Applications \
       --identifier "$PKG_IDENTIFIER" "$PKG" 2>>"$REPORT.log"; then
-    note "已出未签 .pkg：$PKG（无 Developer ID Installer，不能对外分发）"
+    note "已出未签 .pkg：${PKG}（无 Developer ID Installer，不能对外分发）"
   else
     bad "pkgbuild 失败"
   fi
