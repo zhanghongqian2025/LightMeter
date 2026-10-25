@@ -77,6 +77,12 @@ public final class JobStore {
     private final com.litemask.core.ExclusiveGate gate;
     /** 在扫描持有模型闸门时读取，保证身份与实际使用的推理来源是同一时刻。 */
     private final ProcessingIdentity.Provider identityProvider;
+    private final MappingWriter mappingWriter;
+
+    @FunctionalInterface
+    interface MappingWriter {
+        void write(Path path, byte[] content) throws IOException;
+    }
 
     public JobStore(Workspace workspace, List<Rule> rules) {
         this(workspace, rules, List.of());
@@ -117,11 +123,22 @@ public final class JobStore {
                     List<com.litemask.core.EntitySource> sources,
                     com.litemask.core.ExclusiveGate gate,
                     ProcessingIdentity.Provider identityProvider) {
+        this(workspace, rules, sources, gate, identityProvider,
+                com.litemask.core.PrivateFile::write);
+    }
+
+    JobStore(Workspace workspace, List<Rule> rules,
+             List<com.litemask.core.EntitySource> sources,
+             com.litemask.core.ExclusiveGate gate,
+             ProcessingIdentity.Provider identityProvider,
+             MappingWriter mappingWriter) {
         this.workspace = workspace;
         this.rules = rules;
         this.sources = sources == null ? List.of() : List.copyOf(sources);
         this.gate = gate == null ? com.litemask.core.ExclusiveGate.NONE : gate;
         this.identityProvider = identityProvider;
+        this.mappingWriter = mappingWriter == null
+                ? com.litemask.core.PrivateFile::write : mappingWriter;
     }
 
     /** 一个任务的全部状态；所有跨字段变更都在该 job 的监视器内完成。 */
@@ -144,6 +161,8 @@ public final class JobStore {
         final List<String> userTerms = new ArrayList<>();
         /** 成品实际使用的身份；无排除项时与 scanIdentity 是同一个快照。 */
         volatile ProcessingIdentity appliedIdentity;
+        /** 成品基于哪个经人工复核的扫描修订。 */
+        volatile long appliedRevision;
         volatile String outputName;
         /**
          * 映射件的磁盘名。apply 之后才有。
@@ -675,29 +694,49 @@ public final class JobStore {
                 throw new BadRequestException(noText);
             }
         }
+        Job.ScanSnapshot reviewed = job.scanSnapshot;
+        String outputName;
+        DocumentService.Result applied;
+        ProcessingIdentity appliedIdentity;
+        boolean generatedOutput = false;
         if (excl.isEmpty()) {
-            job.outputName = job.scanSnapshot.previewName();
-            job.applied = job.scan();
-            job.appliedIdentity = job.scanIdentity();
+            outputName = reviewed.previewName();
+            applied = reviewed.result();
+            appliedIdentity = reviewed.identity();
         } else {
-            String outName = workspace.newDiskName(job.extension);
-            ProcessingIdentity identity;
+            outputName = workspace.newDiskName(job.extension);
+            generatedOutput = true;
             try (com.litemask.core.ExclusiveGate.Release release = gate.acquire()) {
-                identity = captureIdentity();
-                job.applied = DocumentService.redact(workspace.pathOf(job.sourceName),
-                        workspace.pathOf(outName), job.format, rulesWithUserTerms(job), excl, sources);
-            } catch (TaskContext.CanceledException e) {
+                appliedIdentity = captureIdentity();
+                applied = DocumentService.redact(workspace.pathOf(job.sourceName),
+                        workspace.pathOf(outputName), job.format,
+                        rulesWithUserTerms(job), excl, sources);
+            } catch (RuntimeException | IOException e) {
                 // 半成品：内容不完整，绝不能当成品交出去，也不能留在磁盘上。
-                workspace.delete(outName);
+                workspace.delete(outputName);
                 throw e;
             }
-            job.outputName = outName;
-            job.appliedIdentity = identity;
         }
         // 映射件必须**跟着应用一起产出**。
         // 脱敏件已经能下载了，而映射只在内存里的话，用户拿到的是一份「不可逆」的文件——
         // 那等于把本工具最重要的承诺在界面上悄悄收走，而界面上看不出任何异常。
-        writeMapping(job, passphrase);
+        MappingArtifact mapping;
+        try {
+            mapping = writeMapping(job, applied, appliedIdentity, passphrase);
+        } catch (RuntimeException | IOException e) {
+            if (generatedOutput) {
+                workspace.delete(outputName);
+            }
+            throw e;
+        }
+        // 成品和映射都已安全落盘后，才一次性发布可下载状态。
+        job.applied = applied;
+        job.appliedIdentity = appliedIdentity;
+        job.appliedRevision = reviewed.revision();
+        job.mappingName = mapping.name();
+        job.mappingSealed = mapping.sealed();
+        // outputName 是所有下载/重试路径的发布标志，必须最后写。
+        job.outputName = outputName;
         return job;
     }
 
@@ -725,14 +764,16 @@ public final class JobStore {
      * {@code restore --map --map-pass-env} 直接还原，两边不分裂。
      * 没给口令就写明文——与本工具从前的行为一致，不给口令的用户不该被静默改掉流程。
      */
-    private void writeMapping(Job job, char[] passphrase) throws IOException {
+    private MappingArtifact writeMapping(Job job, DocumentService.Result applied,
+                                         ProcessingIdentity appliedIdentity,
+                                         char[] passphrase) throws IOException {
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("mapping", job.applied.mapping());
+        payload.put("mapping", applied.mapping());
         payload.put("format", job.format.name());
         payload.put("source", job.displayName);
-        payload.put("toolIdentity", identityMap(job.appliedIdentity));
+        payload.put("toolIdentity", identityMap(appliedIdentity));
         List<Map<String, Object>> changes = new ArrayList<>();
-        for (DocumentService.HitItem h : job.applied.hits()) {
+        for (DocumentService.HitItem h : applied.hits()) {
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("ruleKey", h.ruleKey());
             item.put("original", h.original());
@@ -768,9 +809,16 @@ public final class JobStore {
         // 映射件是本工具唯一含原值的产物 → 走 PrivateFile（权限 0600）。
         // 原来用 Files.writeString，权限取决于 umask（默认 0644），
         // 于是同一台机器上的其他用户能直接读到原值。
-        com.litemask.core.PrivateFile.write(workspace.pathOf(name), content);
-        job.mappingName = name;
-        job.mappingSealed = sealed;
+        try {
+            mappingWriter.write(workspace.pathOf(name), content);
+            return new MappingArtifact(name, sealed);
+        } catch (RuntimeException | IOException e) {
+            workspace.delete(name);
+            throw e;
+        }
+    }
+
+    private record MappingArtifact(String name, boolean sealed) {
     }
 
     /** 取映射件的字节，供下载。 */
@@ -1112,9 +1160,10 @@ public final class JobStore {
         out.put("formatLabel", job.format.label());
         out.put("fileName", job.displayName());
         out.put("downloadName", job.downloadName());
-        ProcessingIdentity identity = "applied".equals(stage) ? job.appliedIdentity : job.scanIdentity();
+        boolean appliedStage = "applied".equals(stage);
+        ProcessingIdentity identity = appliedStage ? job.appliedIdentity : job.scanIdentity();
         out.put("toolIdentity", identityMap(identity));
-        out.put("processingRevision", job.scanRevision());
+        out.put("processingRevision", appliedStage ? job.appliedRevision : job.scanRevision());
         if (job.mappingName != null) {
             // 只有应用过才有映射件与还原件。scan 阶段报这两个名字会让界面
             // 以为「现在就能下载映射」——那时候点下去只会拿到一个 400。
