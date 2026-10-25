@@ -120,33 +120,120 @@ version_gt() {
 
 verify_macos_minimum() {
   local app="$1"
-  local declared actual f tmp max_seen="0"
+  local declared actual f max_seen="0"
   declared="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist" 2>/dev/null || true)"
   if [ "$declared" != "$MACOS_MIN_VERSION" ]; then
     echo "X Info.plist 最低系统是 ${declared:-缺失}，应为 $MACOS_MIN_VERSION" >&2
     return 1
   fi
-  tmp="$(mktemp -d)"
-  unzip -qq "$app/Contents/app/$JAR_NAME" 'ai/onnxruntime/native/osx-aarch64/*.dylib' -d "$tmp" || {
-    rm_rf "$tmp"; echo "X 无法提取 ONNX macOS 原生库做最低系统核对" >&2; return 1;
-  }
   while IFS= read -r f; do
     file -b "$f" 2>/dev/null | grep -q 'Mach-O' || continue
     actual="$(xcrun vtool -show-build "$f" 2>/dev/null | awk '$1 == "minos" { print $2; exit }')"
     if [ -z "$actual" ]; then
       echo "X 读不到 Mach-O 最低系统：$f" >&2
-      rm_rf "$tmp"
       return 1
     fi
     if version_gt "$actual" "$MACOS_MIN_VERSION"; then
       echo "X 包内组件要求 macOS ${actual}，高于 Info.plist 声明的 ${MACOS_MIN_VERSION}：$f" >&2
-      rm_rf "$tmp"
       return 1
     fi
     if version_gt "$actual" "$max_seen"; then max_seen="$actual"; fi
-  done < <(find "$app" "$tmp" -type f | LC_ALL=C sort)
-  rm_rf "$tmp"
+  done < <(find "$app" -type f | LC_ALL=C sort)
   echo "    最低系统闸门：Info.plist=${declared}，包内 Mach-O 最大 minos=${max_seen}"
+}
+
+# 把 ORT 两个核心 dylib 从 jar 抽到 App 的固定目录。发布 jar 不再保留可运行时提取的副本，
+# 启动器会把 onnxruntime.native.path 锁定到这里，供逐库签名与 hardened runtime 校验。
+stage_macos_onnx_natives() {
+  local input="$1"
+  local jar="$input/$JAR_NAME"
+  local dest="$input/native/onnxruntime"
+  local prefix="ai/onnxruntime/native/osx-aarch64"
+  local names="libonnxruntime.dylib libonnxruntime4j_jni.dylib"
+  local name entry
+  mkdir -p "$dest"
+  for name in $names; do
+    entry="$prefix/$name"
+    if ! zipinfo -1 "$jar" | awk -v wanted="$entry" '$0 == wanted { found=1 } END { exit(found ? 0 : 1) }'; then
+      echo "X fat jar 缺少 macOS ORT 原生库：$entry" >&2
+      return 1
+    fi
+    unzip -p "$jar" "$entry" > "$dest/$name" || return 1
+    file -b "$dest/$name" | grep -q 'Mach-O' || {
+      echo "X 抽出的 ORT 文件不是 Mach-O：$name" >&2; return 1;
+    }
+  done
+  local core="$dest/libonnxruntime.dylib" jni="$dest/libonnxruntime4j_jni.dylib"
+  local rpath normalized=0 old_core_dep core_dep_count
+  xcrun install_name_tool -id '@loader_path/libonnxruntime.dylib' "$core" || return 1
+  old_core_dep="$(xcrun otool -L "$jni" | awk 'NR>1 && /libonnxruntime[.0-9]*[.]dylib/ && !/4j_jni/ {print $1}')"
+  core_dep_count="$(printf '%s\n' "$old_core_dep" | awk 'NF{n++} END{print n+0}')"
+  [ "$core_dep_count" -eq 1 ] || {
+    echo "X ORT JNI 应恰好依赖一个核心库，实际 $core_dep_count 个" >&2; return 1;
+  }
+  xcrun install_name_tool -id '@loader_path/libonnxruntime4j_jni.dylib' "$jni" || return 1
+  xcrun install_name_tool -change "$old_core_dep" \
+    '@loader_path/libonnxruntime.dylib' "$jni" || return 1
+  while IFS= read -r rpath; do
+    [ -n "$rpath" ] || continue
+    if [ "$rpath" = "@loader_path" ]; then
+      normalized=1
+    elif [ "$normalized" -eq 0 ]; then
+      xcrun install_name_tool -rpath "$rpath" '@loader_path' "$jni" || return 1
+      normalized=1
+    else
+      xcrun install_name_tool -delete_rpath "$rpath" "$jni" || return 1
+    fi
+  done < <(xcrun otool -l "$jni" | awk '/cmd LC_RPATH/{seen=1;next} seen && /path /{print $2;seen=0}')
+  [ "$normalized" -eq 1 ] || {
+    echo "X ORT JNI 库没有可归一化的 LC_RPATH，无法保证只从同目录解析依赖" >&2; return 1;
+  }
+  if xcrun otool -l "$jni" \
+      | awk '/cmd LC_RPATH/{seen=1;next} seen && /path /{if ($2 != "@loader_path") bad=1;seen=0} END{exit(bad ? 0 : 1)}'; then
+    echo "X ORT JNI 库仍含 App 外部 LC_RPATH" >&2
+    return 1
+  fi
+  zip -q -d "$jar" "$prefix/*.dylib" >/dev/null || return 1
+  if zipinfo -1 "$jar" | awk -v p="$prefix/" 'index($0,p)==1 && $0 ~ /[.]dylib$/ { found=1 } END { exit(found ? 0 : 1) }'; then
+    echo "X 发布 jar 仍含 macOS ORT dylib，运行时可能绕过 App 内签名库" >&2
+    return 1
+  fi
+  echo "    ORT 原生库固定目录：Contents/app/native/onnxruntime（jar 内副本已移除）"
+}
+
+assert_sealed_onnx_natives() {
+  local app="$1" dir="$1/Contents/app/native/onnxruntime" name
+  [ -d "$dir" ] || { echo "X App 缺少固定 ORT 目录：$dir" >&2; return 1; }
+  for name in libonnxruntime.dylib libonnxruntime4j_jni.dylib; do
+    [ -f "$dir/$name" ] || { echo "X App 缺少 ORT 原生库：$name" >&2; return 1; }
+    file -b "$dir/$name" | grep -q 'Mach-O' || return 1
+  done
+  if ! xcrun otool -l "$dir/libonnxruntime4j_jni.dylib" \
+      | awk '/cmd LC_RPATH/{seen=1;next} seen && /path /{if ($2 == "@loader_path") ok=1; else bad=1;seen=0} END{exit(ok && !bad ? 0 : 1)}'; then
+    echo "X ORT JNI 的 LC_RPATH 不是唯一固定的 @loader_path" >&2
+    return 1
+  fi
+  if [ "$(xcrun otool -D "$dir/libonnxruntime.dylib" | tail -1)" != \
+       '@loader_path/libonnxruntime.dylib' ]; then
+    echo "X ORT 核心库 install-id 未固定到 @loader_path" >&2
+    return 1
+  fi
+  if ! xcrun otool -L "$dir/libonnxruntime4j_jni.dylib" \
+      | awk 'NR>1 && $1 == "@loader_path/libonnxruntime.dylib" {ok=1} END{exit(ok ? 0 : 1)}'; then
+    echo "X ORT JNI 未固定依赖同目录核心库" >&2
+    return 1
+  fi
+  if xcrun otool -L "$dir"/*.dylib \
+      | awk '/^[[:space:]]+/{p=$1; if (p !~ /^@loader_path\// && p !~ /^\/System\// && p !~ /^\/usr\/lib\//) bad=1} END{exit(bad ? 0 : 1)}'; then
+    echo "X ORT dylib 仍依赖 App 外部非系统路径" >&2
+    return 1
+  fi
+  if zipinfo -1 "$app/Contents/app/$JAR_NAME" \
+      | awk '$0 ~ /^ai\/onnxruntime\/native\/osx-aarch64\/.*[.]dylib$/ { found=1 } END { exit(found ? 0 : 1) }'; then
+    echo "X App jar 仍含可提取的 ORT dylib" >&2
+    return 1
+  fi
+  echo "    ok  两个 ORT dylib 仅存在于 App 固定签名目录"
 }
 
 # ---- 把「已签名的模型包」放进 jpackage 的输入目录 ----------------------------
@@ -375,6 +462,7 @@ fi
 echo "== 3/9 jpackage 打 .app =="
 STAGE="$(mktemp -d)"
 cp "$ROOT/target/$JAR_NAME" "$STAGE/"
+stage_macos_onnx_natives "$STAGE" || { rm_rf "$STAGE"; exit 1; }
 # 随程序分发的已签名模型包（如果有）：放进 --input 目录，
 # jpackage 会把整个输入目录复制到 Contents/app → 程序里的位置是
 # <jar 目录>/models/ner-package/，与 ModelManager.BUNDLED_SUBDIR 同一条规则。
@@ -390,6 +478,7 @@ APP="$OUT/$APP_NAME.app"
 echo "    $APP"
 # 随附模型包真的进包了吗（fail-closed）
 assert_model_package_in_app "$APP"
+assert_sealed_onnx_natives "$APP" || exit 1
 verify_macos_minimum "$APP" || exit 1
 
 fail=0
@@ -778,6 +867,7 @@ echo "== 8/9 jpackage 打核心 .pkg（随程序分发已签名模型包）=="
 rm_rf "$PKGOUT"
 STAGE="$(mktemp -d)"
 cp "$ROOT/target/$JAR_NAME" "$STAGE/"
+stage_macos_onnx_natives "$STAGE" || { rm_rf "$STAGE"; exit 1; }
 # 随附模型包也进 .pkg：用户装完 .pkg，打开应用就自动把模型装好。
 stage_model_package "$STAGE"
 "$JAVA_HOME/bin/jpackage" --type pkg \
@@ -812,6 +902,11 @@ if pkgutil --expand-full "$PKG_FILE" "$PKG_EXPAND/content" >/dev/null 2>&1; then
     fail=1
   else
     echo "    .pkg 内应用最低系统：$PKG_MIN"
+  fi
+  PKG_APP="$(find "$PKG_EXPAND/content" -type d -name "$APP_NAME.app" -print -quit)"
+  if [ -z "$PKG_APP" ] || ! assert_sealed_onnx_natives "$PKG_APP"; then
+    echo "X .pkg 内应用缺少固定 ORT 原生库布局" >&2
+    fail=1
   fi
 else
   echo "X 无法展开 .pkg 核对最低系统" >&2
@@ -908,9 +1003,53 @@ cat > "$RECORD_DIR/PACKAGE-MACOS.json" <<RECORDEOF
 RECORDEOF
 echo "    包操作记录：$RECORD_DIR/PACKAGE-MACOS.json"
 
-echo ""
 if [ "$fail" -ne 0 ]; then
   echo "X 打包完成但**验证没过**，不要发这个包"
   exit 1
 fi
+
+# 法务桌面端只接受能绑定到 clean HEAD 与精确二进制摘要的回执。
+SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+if [ "${#SOURCE_COMMIT}" -ne 40 ] || [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]; then
+  echo "X 构建回执要求完整 40 位 clean HEAD；当前源码有未提交内容，拒绝生成候选回执" >&2
+  exit 1
+fi
+DMG_FILE="$ROOT/target/dmg/$APP_NAME.dmg"
+RECEIPT="$RECORD_DIR/BUILD-RECEIPT.json"
+python3 - "$SOURCE_COMMIT" "$APP/Contents/app/$JAR_NAME" "$PKG_FILE" "$DMG_FILE" \
+  "$APP/Contents/app/native/onnxruntime" "$RECEIPT" <<'PY'
+import datetime, hashlib, json, pathlib, sys
+commit, jar, pkg, dmg, native_dir, receipt = sys.argv[1:]
+def info(kind, path):
+    p = pathlib.Path(path)
+    if not p.is_file():
+        return None
+    data = p.read_bytes()
+    return {"kind": kind, "fileName": p.name, "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+def native(name):
+    p = pathlib.Path(native_dir, name)
+    data = p.read_bytes()
+    return {"file": "Contents/app/native/onnxruntime/" + name,
+            "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+jar_data = pathlib.Path(jar).read_bytes()
+app_data_dir = pathlib.Path(jar).parent
+payload = {
+    "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "sourceCommit": commit,
+    "workingTreeDirty": False,
+    "applicationJarSha256": hashlib.sha256(jar_data).hexdigest(),
+    "artifacts": [x for x in (info("dmg", dmg), info("pkg", pkg)) if x],
+    "modelPackagePresent": any((app_data_dir / "models/ner-package").glob("*.zip")),
+    "expandedModelPresent": (app_data_dir / "models/ner/manifest.json").is_file(),
+    "sealedOnnxNativeRelativeDir": "Contents/app/native/onnxruntime",
+    "sealedOnnxNativeLibraries": [native("libonnxruntime.dylib"),
+                                  native("libonnxruntime4j_jni.dylib")],
+}
+pathlib.Path(receipt).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8")
+PY
+echo "    clean-source 构建回执：$RECEIPT"
+
+echo ""
 echo "PASS 打包并验证通过"

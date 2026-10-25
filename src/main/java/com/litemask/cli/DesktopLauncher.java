@@ -12,7 +12,8 @@ package com.litemask.cli;
  * 依然是完整的 CLI：{@code LightMeter redact a.docx} 照样能用。
  * 这不是「多一个入口」，是同一个入口的两种叫法。
  *
- * <p>刻意保持极薄：不加配置、不读环境变量、不改全局状态。
+ * <p>刻意保持极薄：只在打包版 macOS 入口先锁定 App 内已签名的 ONNX 原生库，
+ * 其余不加配置、不读环境变量。
  * 所有真实逻辑仍在 {@code Main} / {@code ServeCommand} 里，
  * 这里只决定「无参时该干什么」。
  */
@@ -22,6 +23,13 @@ public final class DesktopLauncher {
     }
 
     public static void main(String[] args) {
+        try {
+            MacOnnxRuntimeGuard.configure();
+        } catch (IllegalStateException e) {
+            System.err.println("启动失败: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
         if (args.length > 0) {
             Main.main(args);
             return;

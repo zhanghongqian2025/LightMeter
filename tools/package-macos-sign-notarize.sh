@@ -123,6 +123,15 @@ fi
 #   报错指向公证服务，而真因是**签名名单少了一项**。
 #   → 改成用 `file -b` 逐个判定「是不是 Mach-O」，认的是格式而不是名字。
 COUNT=0
+ORT_NATIVE_DIR="$APP/Contents/app/native/onnxruntime"
+ORT_NATIVE_SIGNED=0
+for ort_name in libonnxruntime.dylib libonnxruntime4j_jni.dylib; do
+  if [ ! -f "$ORT_NATIVE_DIR/$ort_name" ]; then
+    bad "缺少固定 ORT 原生库：Contents/app/native/onnxruntime/$ort_name"
+  elif ! file -b "$ORT_NATIVE_DIR/$ort_name" 2>/dev/null | grep -q 'Mach-O'; then
+    bad "固定 ORT 原生库不是 Mach-O：$ort_name"
+  fi
+done
 while IFS= read -r item; do
   [ "$item" = "$APP" ] && continue
   case "$item" in
@@ -130,6 +139,10 @@ while IFS= read -r item; do
   esac
   if sign_code "$item" 2>>"$REPORT.log"; then
     COUNT=$((COUNT + 1))
+    case "$item" in
+      "$ORT_NATIVE_DIR/libonnxruntime.dylib"|"$ORT_NATIVE_DIR/libonnxruntime4j_jni.dylib")
+        ORT_NATIVE_SIGNED=$((ORT_NATIVE_SIGNED + 1)) ;;
+    esac
   else
     bad "嵌套签名失败：${item#$APP/}"
     sed 's/^/      /' "$REPORT.log" | tail -5
@@ -147,6 +160,11 @@ done < <(
   find "$APP" \( -name '*.framework' -o -name '*.app' -o -name '*.bundle' \) -type d 2>/dev/null | sort -r
 )
 note "已签嵌套项：$COUNT"
+if [ "$ORT_NATIVE_SIGNED" -eq 2 ]; then
+  ok "两个固定 ORT dylib 已逐库签名"
+else
+  bad "固定 ORT dylib 逐库签名不完整：应为 2，实际 $ORT_NATIVE_SIGNED"
+fi
 
 if [ -f "$ENTITLEMENTS" ]; then
   APP_SIGN_ARGS=(--entitlements "$ENTITLEMENTS" "$APP")
