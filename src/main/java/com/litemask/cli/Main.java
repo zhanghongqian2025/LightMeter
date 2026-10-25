@@ -22,7 +22,10 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -157,7 +160,7 @@ public final class Main {
             System.out.write(out, 0, out.length);
             System.out.flush();
             if (opt.mapPath != null) {
-                mapWriter.write(Path.of(opt.mapPath), textMappingPayload(result));
+                mapWriter.write(Path.of(opt.mapPath), textMappingPayload(result), out);
             }
             return 0;
         }
@@ -205,7 +208,7 @@ public final class Main {
 
             Path map = opt.mapPath != null ? Path.of(opt.mapPath)
                     : Path.of(input + ".redacted.map.json");
-            mapWriter.write(map, textMappingPayload(result));
+            mapWriter.write(map, textMappingPayload(result), out);
 
             System.out.printf("%s → %s（%d 处，映射 %s）%n",
                     in, out, result.changes().size(), map);
@@ -221,7 +224,7 @@ public final class Main {
         Path map = opt.mapPath != null ? Path.of(opt.mapPath)
                 : Path.of(in + ".redacted.map.json");
         DocxRedactor.Report report = DocxRedactor.redact(in, out, rules, Exclusions.NONE, sources);
-        mapWriter.write(map, docxMappingPayload(report));
+        mapWriter.write(map, docxMappingPayload(report), out);
         System.out.printf("%s → %s（%d 处，清空 %d 个文档属性，映射 %s）%n",
                 in, out, report.hits().size(), report.metadataFieldsCleared(), map);
     }
@@ -294,6 +297,10 @@ public final class Main {
         }
         @SuppressWarnings("unchecked")
         Map<String, String> mapping = (Map<String, String>) mappingNode;
+
+        if (!verifyMappingBinding(mapFile, opt.positional)) {
+            return 1;
+        }
 
         for (String input : opt.positional) {
             Path in = Path.of(input);
@@ -410,7 +417,7 @@ public final class Main {
                     item.put("original", h.original());
                     item.put("token", h.token());
                     return item;
-                }).toList()));
+                }).toList()), out);
         System.out.printf("%s → %s（%d 处，工作表名 %d 个，清空 %d 个属性，映射 %s）%n",
                 in, out, report.hits().size(), report.sheetNamesRedacted(), report.metadataFieldsCleared(), map);
         if (report.numericCellsConverted() > 0) {
@@ -451,7 +458,7 @@ public final class Main {
                     // 而它在 PDF 里并不存在，所以不能只留它。
                     item.put("engineToken", h.engineToken());
                     return item;
-                }).toList()));
+                }).toList()), out);
         System.out.printf("%s → %s（%d 处，%d 页 / %d 条内容流 / %d 个字符，清掉 %d 项隐藏信息，映射 %s）%n",
                 in, out, report.changeCount(), report.pageCount(), report.unitCount(),
                 report.textChars(), report.removedMetadata().size(), map);
@@ -518,7 +525,7 @@ public final class Main {
                     item.put("original", h.original());
                     item.put("token", h.token());
                     return item;
-                }).toList()));
+                }).toList()), out);
         System.out.printf("%s → %s（%d 处，%d 个文本对象 / %d 个 TextCode，改写 %d 个部件，映射 %s）%n",
                 in, out, report.hits().size(), report.textObjects(), report.textCodes(),
                 report.partsRewritten(), map);
@@ -558,7 +565,7 @@ public final class Main {
                     item.put("original", h.original());
                     item.put("token", h.token());
                     return item;
-                }).toList()));
+                }).toList()), out);
         System.out.printf("%s → %s（%d 处，清空 %d 个属性，映射 %s）%n",
                 in, out, report.hits().size(), report.metadataFieldsCleared(), map);
         if (report.numericChartValuesRedacted() > 0) {
@@ -660,6 +667,53 @@ public final class Main {
     }
 
     /**
+     * 在开始写任何还原件之前，确认映射就是为这些脱敏件生成的。
+     * 旧映射没有绑定信息，仍允许还原但必须明确警告，避免切断历史数据恢复路径。
+     * 绑定的是脱敏件的精确字节；两份逐字节相同的脱敏件在还原端没有可区分证据。
+     */
+    private static boolean verifyMappingBinding(Map<String, Object> mapFile, List<String> inputs)
+            throws IOException {
+        Object node = mapFile.get("binding");
+        if (node == null) {
+            System.err.println("警告: 这是旧版映射件，没有脱敏件摘要，无法核对映射是否配对；"
+                    + "请人工确认文件与映射来自同一次脱敏。");
+            return true;
+        }
+        if (!(node instanceof Map<?, ?> binding)) {
+            System.err.println("错误: 映射件里的 binding 段格式不对。");
+            return false;
+        }
+        Object algo = binding.get("algorithm");
+        Object digest = binding.get("sha256");
+        Object bytes = binding.get("bytes");
+        if (!"SHA-256".equals(algo)
+                || !(digest instanceof String expected) || !expected.matches("[0-9a-f]{64}")
+                || !(bytes instanceof Number size) || size.longValue() < 0) {
+            System.err.println("错误: 映射件里的脱敏件摘要信息不完整或不认识。");
+            return false;
+        }
+        for (String input : inputs) {
+            Path file = Path.of(input);
+            long actualSize = Files.size(file);
+            String actual = sha256(Files.readAllBytes(file));
+            if (actualSize != size.longValue() || !actual.equals(expected)) {
+                System.err.println("错误: 这个映射件不属于这份脱敏件（文件长度或 SHA-256 不一致）。");
+                System.err.println("  请选回同一次脱敏生成的映射件；当前文件不会被还原或覆盖。");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String sha256(byte[] bytes) throws IOException {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("运行时没有 SHA-256，无法绑定映射件", e);
+        }
+    }
+
+    /**
      * 映射件的写出口。
      *
      * <p>它是**唯一**决定「映射件长什么样、落在什么权限上」的地方 ——
@@ -690,8 +744,18 @@ public final class Main {
             return passphrase != null;
         }
 
-        void write(Path path, Map<String, Object> payload) throws IOException {
-            byte[] json = JSON.writeValueAsBytes(payload);
+        void write(Path path, Map<String, Object> payload, Path redacted) throws IOException {
+            write(path, payload, Files.readAllBytes(redacted));
+        }
+
+        void write(Path path, Map<String, Object> payload, byte[] redacted) throws IOException {
+            Map<String, Object> bound = new LinkedHashMap<>(payload);
+            Map<String, Object> binding = new LinkedHashMap<>();
+            binding.put("algorithm", "SHA-256");
+            binding.put("sha256", sha256(redacted));
+            binding.put("bytes", redacted.length);
+            bound.put("binding", binding);
+            byte[] json = JSON.writeValueAsBytes(bound);
             if (passphrase != null) {
                 byte[] sealed;
                 try {
