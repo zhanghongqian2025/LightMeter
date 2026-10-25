@@ -9,12 +9,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.litemask.core.Exclusions;
 import com.litemask.core.PrivateFile;
+import com.litemask.core.TaskContext;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -62,6 +65,41 @@ class JobStoreApplyTransactionTest {
             assertTrue(Files.exists(ws.pathOf(retried.outputNameForTest())));
             assertTrue(Files.exists(ws.pathOf(retried.mappingNameForTest())));
             assertTrue(jobs.mappingBytes(retried).length > 0);
+        }
+    }
+
+    @Test
+    void cancellationAfterMappingWriteDeletesMapPreservesPreviewAndAllowsRetry() throws Exception {
+        AtomicReference<TaskContext> context = new AtomicReference<>();
+        AtomicBoolean firstWrite = new AtomicBoolean(true);
+        JobStore.MappingWriter cancelAfterWrite = (path, content) -> {
+            PrivateFile.write(path, content);
+            if (firstWrite.getAndSet(false)) {
+                context.get().cancel();
+            }
+        };
+
+        try (Workspace ws = Workspace.open(tmp.resolve("cancel-after-map"))) {
+            JobStore jobs = new JobStore(ws, ApiHandlers.defaultRules(), List.of(),
+                    com.litemask.core.ExclusiveGate.NONE, null, cancelAfterWrite);
+            JobStore.Job job = jobs.scan("case.txt",
+                    "电话13800138000。".getBytes(StandardCharsets.UTF_8));
+            long filesBeforeApply = fileCount(ws.sessionDir());
+            TaskContext ctx = TaskContext.create(null);
+            context.set(ctx);
+
+            assertThrows(TaskContext.CanceledException.class,
+                    () -> jobs.applyCancellable(job.jobId(), Exclusions.NONE, ctx));
+            assertNull(job.outputNameForTest());
+            assertNull(job.mappingNameForTest());
+            assertNull(job.applied);
+            assertEquals(filesBeforeApply, fileCount(ws.sessionDir()),
+                    "已写完但尚未发布的映射必须回滚，扫描预览必须保留");
+            assertTrue(Files.exists(ws.pathOf(job.previewNameForTest())));
+
+            JobStore.Job retried = jobs.apply(job.jobId(), Exclusions.NONE);
+            assertNotNull(retried.outputNameForTest());
+            assertNotNull(retried.mappingNameForTest());
         }
     }
 

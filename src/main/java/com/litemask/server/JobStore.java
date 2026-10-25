@@ -699,6 +699,7 @@ public final class JobStore {
 
     /** 已持有该 job 监视器后的应用逻辑。 */
     private Job applyClaimed(Job job, Exclusions excl, char[] passphrase) throws IOException {
+        TaskContext.current().checkCancelled();
         verifyExclusionsMatch(job, excl);
         verifyGroupClosure(job, excl);
         verifyNoPositionExclusionInMergedRow(job, excl);
@@ -739,10 +740,15 @@ public final class JobStore {
         // 映射件必须**跟着应用一起产出**。
         // 脱敏件已经能下载了，而映射只在内存里的话，用户拿到的是一份「不可逆」的文件——
         // 那等于把本工具最重要的承诺在界面上悄悄收走，而界面上看不出任何异常。
-        MappingArtifact mapping;
+        MappingArtifact mapping = null;
         try {
+            TaskContext.current().checkCancelled();
             mapping = writeMapping(job, applied, appliedIdentity, passphrase);
+            TaskContext.current().checkCancelled();
         } catch (RuntimeException | IOException e) {
+            if (mapping != null) {
+                workspace.delete(mapping.name());
+            }
             if (generatedOutput) {
                 workspace.delete(outputName);
             }

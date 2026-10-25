@@ -2,6 +2,7 @@ package com.litemask.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,6 +11,7 @@ import com.litemask.core.Exclusions;
 import com.litemask.core.Match;
 import com.litemask.core.ProcessingIdentity;
 import com.litemask.core.RuleLoader;
+import com.litemask.core.TaskContext;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -104,6 +106,46 @@ class JobStoreMutationRaceTest {
                     () -> terms.get(5, TimeUnit.SECONDS));
             assertTrue(failure.getCause() instanceof JobStore.BadRequestException);
             assertTrue(Files.exists(ws.pathOf(applied.outputNameForTest())));
+        }
+    }
+
+    @Test
+    void canceledZeroExclusionApplyQueuedBehindRescanLeavesNoProductsAndCanRetry() throws Exception {
+        BlockingSource source = new BlockingSource();
+        AtomicReference<ProcessingIdentity> current = new AtomicReference<>(MODEL_A);
+        try (Workspace ws = Workspace.open(tmp.resolve("cancel-queued"));
+             ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            JobStore jobs = store(ws, source, current);
+            JobStore.Job job = jobs.scan("case.txt", sample());
+
+            source.arm();
+            Future<JobStore.Job> terms = pool.submit(
+                    () -> jobs.addUserTerms(job.jobId(), List.of("合同")));
+            assertTrue(source.awaitEntered(), "补词重扫应持有 job 锁");
+
+            TaskContext ctx = TaskContext.create(null);
+            CountDownLatch applyStarted = new CountDownLatch(1);
+            Future<JobStore.Job> apply = pool.submit(() -> {
+                applyStarted.countDown();
+                return jobs.applyCancellable(job.jobId(), Exclusions.NONE, ctx);
+            });
+            assertTrue(applyStarted.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> apply.get(200, TimeUnit.MILLISECONDS));
+            ctx.cancel();
+            source.release();
+
+            terms.get(5, TimeUnit.SECONDS);
+            ExecutionException canceled = assertThrows(ExecutionException.class,
+                    () -> apply.get(5, TimeUnit.SECONDS));
+            assertTrue(canceled.getCause() instanceof TaskContext.CanceledException);
+            assertNull(job.outputNameForTest());
+            assertNull(job.mappingNameForTest());
+            assertTrue(Files.exists(ws.pathOf(job.previewNameForTest())),
+                    "零排除取消不能删掉仍供重试使用的扫描预览");
+
+            JobStore.Job retried = jobs.apply(job.jobId(), Exclusions.NONE);
+            assertEquals(retried.previewNameForTest(), retried.outputNameForTest());
+            assertTrue(Files.exists(ws.pathOf(retried.mappingNameForTest())));
         }
     }
 
