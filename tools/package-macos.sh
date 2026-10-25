@@ -66,6 +66,20 @@ read_prop 'main\.class' main.class MAIN_CLASS || exit 1
 read_prop 'jar\.name' jar.name JAR_NAME || exit 1
 read_prop 'jlink\.modules' jlink.modules MODULES || exit 1
 read_prop 'jvm\.args' jvm.args JVM_ARGS || exit 1
+read_prop 'macos\.minimum\.version' macos.minimum.version MACOS_MIN_VERSION || exit 1
+
+# jpackage 21 的内置 Info-lite.plist.template 把最低系统写死为 10.11，
+# 但本包的 ONNX Runtime arm64 dylib 实际要求 13.3。用资源模板覆盖，并在
+# target 下把唯一真源里的版本代入。jpackage 在 --resource-dir 里按它的
+# publicName 查找这个资源，实际文件名必须是 Info.plist；app-image 与 pkg
+# 必须共用同一份模板。
+RESOURCE_TEMPLATE="$ROOT/tools/macos-resources/Info-lite.plist.template"
+RESOURCE_STAGE="$ROOT/target/jpackage-resources"
+[ -f "$RESOURCE_TEMPLATE" ] || { echo "X 缺少 jpackage Info.plist 模板：$RESOURCE_TEMPLATE" >&2; exit 1; }
+rm_rf "$RESOURCE_STAGE"
+mkdir -p "$RESOURCE_STAGE"
+sed "s/DEPLOY_MINIMUM_SYSTEM_VERSION/$MACOS_MIN_VERSION/g" \
+  "$RESOURCE_TEMPLATE" > "$RESOURCE_STAGE/Info.plist"
 
 # 模型包目录：默认为空表示核心包不带模型（方案 B：AI 包独立分发）。
 # 用 --ner-model 显式指定，或塞进 ~/.litemask/models/ner 都能启用。
@@ -92,6 +106,48 @@ PKGOUT="$ROOT/target/pkg"
 
 bytes() { find "$1" -type f -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
 mib() { awk -v b="$1" 'BEGIN{printf "%.2f", b/1048576}'; }
+
+version_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, av, "."); split(b, bv, ".");
+    for (i = 1; i <= 3; i++) {
+      ai = (av[i] == "" ? 0 : av[i] + 0); bi = (bv[i] == "" ? 0 : bv[i] + 0);
+      if (ai > bi) exit 0; if (ai < bi) exit 1;
+    }
+    exit 1;
+  }'
+}
+
+verify_macos_minimum() {
+  local app="$1"
+  local declared actual f tmp max_seen="0"
+  declared="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist" 2>/dev/null || true)"
+  if [ "$declared" != "$MACOS_MIN_VERSION" ]; then
+    echo "X Info.plist 最低系统是 ${declared:-缺失}，应为 $MACOS_MIN_VERSION" >&2
+    return 1
+  fi
+  tmp="$(mktemp -d)"
+  unzip -qq "$app/Contents/app/$JAR_NAME" 'ai/onnxruntime/native/osx-aarch64/*.dylib' -d "$tmp" || {
+    rm_rf "$tmp"; echo "X 无法提取 ONNX macOS 原生库做最低系统核对" >&2; return 1;
+  }
+  while IFS= read -r f; do
+    file -b "$f" 2>/dev/null | grep -q 'Mach-O' || continue
+    actual="$(xcrun vtool -show-build "$f" 2>/dev/null | awk '$1 == "minos" { print $2; exit }')"
+    if [ -z "$actual" ]; then
+      echo "X 读不到 Mach-O 最低系统：$f" >&2
+      rm_rf "$tmp"
+      return 1
+    fi
+    if version_gt "$actual" "$MACOS_MIN_VERSION"; then
+      echo "X 包内组件要求 macOS ${actual}，高于 Info.plist 声明的 ${MACOS_MIN_VERSION}：$f" >&2
+      rm_rf "$tmp"
+      return 1
+    fi
+    if version_gt "$actual" "$max_seen"; then max_seen="$actual"; fi
+  done < <(find "$app" "$tmp" -type f | LC_ALL=C sort)
+  rm_rf "$tmp"
+  echo "    最低系统闸门：Info.plist=${declared}，包内 Mach-O 最大 minos=${max_seen}"
+}
 
 # ---- 把「已签名的模型包」放进 jpackage 的输入目录 ----------------------------
 #
@@ -327,13 +383,14 @@ rm_rf "$OUT"
 "$JAVA_HOME/bin/jpackage" --type app-image \
   --name "$APP_NAME" --app-version "$APP_VERSION" \
   --input "$STAGE" --main-jar "$JAR_NAME" --main-class "$MAIN_CLASS" \
-  --runtime-image "$RT" --dest "$OUT" \
+  --runtime-image "$RT" --dest "$OUT" --resource-dir "$RESOURCE_STAGE" \
   --java-options "$JVM_ARGS" || { echo "jpackage 失败"; rm_rf "$STAGE"; exit 1; }
 rm_rf "$STAGE"
 APP="$OUT/$APP_NAME.app"
 echo "    $APP"
 # 随附模型包真的进包了吗（fail-closed）
 assert_model_package_in_app "$APP"
+verify_macos_minimum "$APP" || exit 1
 
 fail=0
 
@@ -726,23 +783,41 @@ stage_model_package "$STAGE"
 "$JAVA_HOME/bin/jpackage" --type pkg \
   --name "$APP_NAME" --app-version "$APP_VERSION" \
   --input "$STAGE" --main-jar "$JAR_NAME" --main-class "$MAIN_CLASS" \
-  --runtime-image "$RT" --dest "$PKGOUT" \
+  --runtime-image "$RT" --dest "$PKGOUT" --resource-dir "$RESOURCE_STAGE" \
   --java-options "$JVM_ARGS" || { echo "jpackage pkg 失败"; rm_rf "$STAGE"; exit 1; }
 rm_rf "$STAGE"
 ls -1 "$PKGOUT"
+PKG_COUNT="$(find "$PKGOUT" -maxdepth 1 -type f -name '*.pkg' | wc -l | tr -d ' ')"
+[ "$PKG_COUNT" = "1" ] || { echo "X 预期恰好一个 .pkg，实际 $PKG_COUNT 个" >&2; exit 1; }
+PKG_FILE="$(find "$PKGOUT" -maxdepth 1 -type f -name '*.pkg' -print -quit)"
 # .pkg 的签名状态要**单独查**：
 #   jpackage --type pkg 会**重新造一个 .app** 放进包里，
 #   所以第 6 步给 app-image 的签名**不会**带进 .pkg。
 #   「app 签过了」不等于「pkg 里的 app 签过了」——这里直接查，不靠推断。
 PKG_SIGN_AUTHORITY=""
-if [ -f "$PKGOUT/$APP_NAME.pkg" ]; then
-  PKG_SIGN_AUTHORITY="$(pkgutil --check-signature "$PKGOUT/$APP_NAME.pkg" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
+if [ -f "$PKG_FILE" ]; then
+  PKG_SIGN_AUTHORITY="$(pkgutil --check-signature "$PKG_FILE" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
   if [ -n "$PKG_SIGN_AUTHORITY" ]; then
     echo "    .pkg 签名身份：${PKG_SIGN_AUTHORITY}"
   else
     echo "    .pkg 未签名（没有 Developer ID Installer 身份）→ 不能对外分发"
   fi
 fi
+PKG_EXPAND="$(mktemp -d)"
+if pkgutil --expand-full "$PKG_FILE" "$PKG_EXPAND/content" >/dev/null 2>&1; then
+  PKG_PLIST="$(find "$PKG_EXPAND/content" -path "*/$APP_NAME.app/Contents/Info.plist" -print -quit)"
+  PKG_MIN="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PKG_PLIST" 2>/dev/null || true)"
+  if [ "$PKG_MIN" != "$MACOS_MIN_VERSION" ]; then
+    echo "X .pkg 内应用最低系统是 ${PKG_MIN:-缺失}，应为 $MACOS_MIN_VERSION" >&2
+    fail=1
+  else
+    echo "    .pkg 内应用最低系统：$PKG_MIN"
+  fi
+else
+  echo "X 无法展开 .pkg 核对最低系统" >&2
+  fail=1
+fi
+rm_rf "$PKG_EXPAND"
 PKG_BYTES=$(bytes "$PKGOUT")
 echo "    合计 $PKG_BYTES B = $(mib "$PKG_BYTES") MiB"
 
@@ -755,24 +830,6 @@ echo "    合计 $PKG_BYTES B = $(mib "$PKG_BYTES") MiB"
 #     · 模型 —— 随程序分发的识别模型多大；
 #     · 安装后占用 —— 装到机器上之后实际占多少磁盘。
 #   只报一个「合计」的话，用户既不知道下载要多少流量，也不知道装完要腾多少空间。
-echo ""
-echo "== 体积报告（安装包 / 模型 / 安装后）=="
-DMG_BYTES=0
-if [ -d "$ROOT/target/dmg" ]; then DMG_BYTES=$(bytes "$ROOT/target/dmg"); fi
-MODEL_BYTES=0
-if [ -n "$MODEL_PACKAGE_DIR" ] && [ -d "$MODEL_PACKAGE_DIR" ]; then
-  MODEL_BYTES=$(bytes "$MODEL_PACKAGE_DIR")
-fi
-APP_BYTES=$(bytes "$APP")
-echo "    安装包（.pkg）         = $PKG_BYTES B = $(mib "$PKG_BYTES") MiB"
-echo "    安装包（.dmg）         = $DMG_BYTES B = $(mib "$DMG_BYTES") MiB"
-if [ "$MODEL_BYTES" -gt 0 ]; then
-  echo "    模型（随程序分发）     = $MODEL_BYTES B = $(mib "$MODEL_BYTES") MiB"
-else
-  echo "    模型（随程序分发）     = 未随包分发"
-fi
-echo "    安装后占用（.app 实测）= $APP_BYTES B = $(mib "$APP_BYTES") MiB"
-
 # ---- 第 9 步：.dmg（拖拽安装形态）----
 #
 # 为什么放在这个脚本里，而不是让它自己跑：
@@ -794,6 +851,26 @@ else
   fi
 fi
 
+echo ""
+echo "== 体积报告（安装包 / 模型 / 安装后）=="
+DMG_BYTES=0
+if [ "${SKIP_DMG:-}" != "1" ] && [ -d "$ROOT/target/dmg" ]; then
+  DMG_BYTES=$(bytes "$ROOT/target/dmg")
+fi
+MODEL_BYTES=0
+if [ -n "$MODEL_PACKAGE_DIR" ] && [ -d "$MODEL_PACKAGE_DIR" ]; then
+  MODEL_BYTES=$(bytes "$MODEL_PACKAGE_DIR")
+fi
+APP_BYTES=$(bytes "$APP")
+echo "    安装包（.pkg）         = $PKG_BYTES B = $(mib "$PKG_BYTES") MiB"
+echo "    安装包（.dmg）         = $DMG_BYTES B = $(mib "$DMG_BYTES") MiB"
+if [ "$MODEL_BYTES" -gt 0 ]; then
+  echo "    模型（随程序分发）     = $MODEL_BYTES B = $(mib "$MODEL_BYTES") MiB"
+else
+  echo "    模型（随程序分发）     = 未随包分发"
+fi
+echo "    安装后占用（.app 实测）= $APP_BYTES B = $(mib "$APP_BYTES") MiB"
+
 # ---- 落盘「包操作记录」----
 # stdout 会滚走；交付时要能拿出**这一份**证据：
 # 包在哪、什么架构、装了多大、带没带模型、验证过没有。
@@ -807,6 +884,7 @@ cat > "$RECORD_DIR/PACKAGE-MACOS.json" <<RECORDEOF
   "product": "LightMeter",
   "platform": "darwin",
   "architecture": "$HOST_ARCH",
+  "minimumMacOS": "$MACOS_MIN_VERSION",
   "appVersion": "$APP_VERSION",
   "application": "$ROOT/target/app-image/$APP_NAME.app",
   "packageDirectory": "$PKGOUT",
