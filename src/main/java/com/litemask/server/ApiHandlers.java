@@ -219,6 +219,10 @@ public final class ApiHandlers {
         m.put("stateLabel", s.state().label());
         m.put("usable", s.usable());
         m.put("modelId", s.modelId());
+        m.put("modelVersionKey", s.modelVersionKey());
+        m.put("modelPackageSha256", s.modelPackageSha256());
+        m.put("modelSigningKeyId", s.modelSigningKeyId());
+        m.put("signatureVerified", s.signatureVerified());
         m.put("personName", s.personName());
         m.put("organizationName", s.organizationName());
         m.put("message", s.message());

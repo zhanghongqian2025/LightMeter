@@ -129,6 +129,11 @@ class ModelManagerTest {
         assertEquals(ModelManager.State.READY, s.state(), "装上就该是「可用」，实际：" + s.state());
         assertTrue(s.usable(), "装上就该说可用");
         assertEquals("test-model-v1", s.modelId(), "要报出当前模型版本");
+        assertTrue(s.signatureVerified(), "生产界面使用的模型必须能复验发布签名");
+        assertNotNull(s.modelVersionKey(), "要给审批链一个内容寻址的模型版本键");
+        assertNotNull(s.modelPackageSha256(), "要报出被签名发布包的摘要");
+        assertEquals(ModelPackageSignature.keyIdOf(kp.getPublic()), s.modelSigningKeyId(),
+                "要报出实际验签使用的密钥标识");
         assertTrue(s.personName(), "要报出支持人名识别");
         assertTrue(s.organizationName(), "要报出支持机构名识别");
         assertTrue(s.bundledAvailable(), "要说清楚安装包里带了随附模型");
@@ -137,6 +142,29 @@ class ModelManagerTest {
         // 真的装进了用户数据目录
         Path installed = tmp.resolve("store").resolve("ner.onnx");
         assertTrue(Files.isRegularFile(installed), "模型应当装到用户数据目录，实际没有：" + installed);
+    }
+
+    @Test
+    @DisplayName("生产界面不直载无签名收据的展开目录；显式开发目录仍可用但标成未验签")
+    void 生产界面要求可复验收据而显式目录保留(@TempDir Path tmp) throws IOException {
+        Path expanded = tmp.resolve("store");
+        NerModelFixtures.writePackage(expanded);
+
+        ModelManager production = new ModelManager(expanded, null, tmp.resolve("bundle"));
+        production.bootstrapSync();
+        ModelManager.Status blocked = production.status();
+        assertFalse(blocked.usable(), "仅有展开文件不能冒充已验签发布模型");
+        assertEquals(ModelManager.State.BROKEN, blocked.state());
+        assertFalse(blocked.signatureVerified());
+        assertTrue(blocked.failure().contains("签名来源"), "应说清卡在来源复验：" + blocked.failure());
+
+        ModelManager explicit = new ModelManager(tmp.resolve("unused"), expanded, tmp.resolve("bundle"));
+        explicit.bootstrapSync();
+        ModelManager.Status developer = explicit.status();
+        assertTrue(developer.usable(), "显式 --ner-model 开发/排障入口应保持可用");
+        assertEquals(ModelManager.State.READY, developer.state(), "显式目录加载成功也应报就绪");
+        assertFalse(developer.signatureVerified(), "显式直载目录不能被标成已验签");
+        explicit.close();
     }
 
     @Test

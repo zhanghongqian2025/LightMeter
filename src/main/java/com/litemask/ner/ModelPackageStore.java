@@ -101,6 +101,7 @@ public final class ModelPackageStore {
 
     private final Path activeDir;
     private final Path versionsDir;
+    private final Path receiptsDir;
     private final Path lockFile;
     private final ModelPackageInstaller installer;
     private final ModelPackageInstaller.Mover mover;
@@ -155,6 +156,7 @@ public final class ModelPackageStore {
             throw new IllegalArgumentException("模型包目录必须是一个带父目录的普通路径: " + activeDir);
         }
         this.versionsDir = this.activeDir.resolveSibling(this.activeDir.getFileName() + ".versions");
+        this.receiptsDir = this.activeDir.resolveSibling(this.activeDir.getFileName() + ".receipts");
         Path parent = this.activeDir.getParent();
         this.lockFile = parent.resolve("." + this.activeDir.getFileName() + ".锁");
         this.mover = Objects.requireNonNull(mover, "mover");
@@ -358,6 +360,15 @@ public final class ModelPackageStore {
             }
             mover.move(staging, dest);
 
+            if (!allowUnsigned) {
+                try {
+                    persistReceipt(zip, key);
+                } catch (IOException e) {
+                    ModelPackageInstaller.deleteRecursively(dest);
+                    throw new IOException("已校验模型，但保存签名收据失败，未启用这份模型：" + e.getMessage(), e);
+                }
+            }
+
             List<String> warnings = new ArrayList<>();
             if (allowUnsigned) {
                 // 跳过验签是用户明确要求的，但**必须说出来**：
@@ -379,6 +390,55 @@ public final class ModelPackageStore {
                     previousKey, warnings);
         } finally {
             unlock();
+        }
+    }
+
+    /**
+     * 生产界面在加载已经展开的模型前，重新核对它来自一份仍可验签的发布包。
+     * 只校验展开目录自身不够：攻击者可以同时替换模型、清单与清单内摘要。
+     */
+    public Provenance verifyActiveProvenance() throws IOException {
+        if (!Files.isDirectory(activeDir)) {
+            throw new IOException("没有生效中的模型目录");
+        }
+        String key = keyOf(activeDir);
+        Path zip = receiptsDir.resolve(key + ".zip");
+        Path sig = ModelTrust.signatureFileFor(zip);
+        if (!Files.isRegularFile(zip) || !Files.isRegularFile(sig)) {
+            throw new IOException("当前模型没有可复验的签名收据；请从已签名模型包重新安装");
+        }
+        ModelTrust.verifyPackage(zip);
+        Path work = Files.createTempDirectory("litemask-model-receipt-");
+        Path extracted = work.resolve("package");
+        try {
+            installer.install(zip, extracted);
+            String expected = digest(extracted);
+            String actual = digest(activeDir);
+            if (!expected.equals(actual)) {
+                throw new IOException("当前展开模型与已签名发布包内容不一致");
+            }
+            ModelPackageSignature.Envelope env = ModelPackageSignature.parseEnvelope(Files.readAllBytes(sig));
+            return new Provenance(key, env.sha256(), env.keyId());
+        } finally {
+            ModelPackageInstaller.deleteRecursively(work);
+        }
+    }
+
+    /** 已验签发布包对当前展开版本的可复验身份。 */
+    public record Provenance(String versionKey, String packageSha256, String signingKeyId) {
+    }
+
+    private void persistReceipt(Path zip, String key) throws IOException {
+        Path sig = ModelTrust.signatureFileFor(zip);
+        Files.createDirectories(receiptsDir);
+        Path saved = receiptsDir.resolve(key + ".zip");
+        Files.copy(zip, saved, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        try {
+            Files.copy(sig, ModelTrust.signatureFileFor(saved),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            Files.deleteIfExists(saved);
+            throw e;
         }
     }
 
@@ -519,6 +579,7 @@ public final class ModelPackageStore {
             if (!ModelPackageInstaller.deleteRecursively(target.dir())) {
                 throw new IOException("删不掉这个版本（可能正被别的进程占用）：" + target.dir());
             }
+            deleteReceipt(target.key());
         } finally {
             unlock();
         }
@@ -682,12 +743,20 @@ public final class ModelPackageStore {
         for (int i = MAX_HISTORY; i < history.size(); i++) {
             Version v = history.get(i);
             if (ModelPackageInstaller.deleteRecursively(v.dir())) {
+                deleteReceipt(v.key());
                 warnings.add("历史版本太多（上限 " + MAX_HISTORY + " 个），已删掉最旧的 " + v.key());
             } else {
                 warnings.add("历史版本太多（上限 " + MAX_HISTORY + " 个），但最旧的 " + v.key()
                         + " 删不掉（可能正被别的进程占用），请用 model remove 手动清理");
             }
         }
+    }
+
+    /** 版本内容已经删除时，同步清掉它的签名发布包收据，避免模型更新长期堆积。 */
+    private void deleteReceipt(String key) throws IOException {
+        Path zip = receiptsDir.resolve(key + ".zip");
+        Files.deleteIfExists(ModelTrust.signatureFileFor(zip));
+        Files.deleteIfExists(zip);
     }
 
     // ------------------------------------------------------------ 版本名解析

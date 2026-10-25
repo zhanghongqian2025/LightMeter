@@ -147,6 +147,10 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
     public record Status(State state,
                          boolean usable,
                          String modelId,
+                         String modelVersionKey,
+                         String modelPackageSha256,
+                         String modelSigningKeyId,
+                         boolean signatureVerified,
                          boolean personName,
                          boolean organizationName,
                          String message,
@@ -198,6 +202,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
     private volatile String failure;
     private volatile String nextStep;
     private volatile boolean installedFromBundle;
+    private volatile ModelPackageStore.Provenance activeProvenance;
 
     /** 生产构造：装到当前用户的数据目录。 */
     public ModelManager() {
@@ -524,7 +529,13 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
         }
         actions.add("import");
         Optional<BundledPackage> bundled = findBundledPackage();
-        return new Status(state, usable, modelId, person, org,
+        ModelPackageStore.Provenance provenance = activeProvenance;
+        return new Status(state, usable, modelId,
+                provenance == null ? null : provenance.versionKey(),
+                provenance == null ? null : provenance.packageSha256(),
+                provenance == null ? null : provenance.signingKeyId(),
+                provenance != null,
+                person, org,
                 currentMessage(usable),
                 nextStep,
                 actions,
@@ -624,6 +635,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
             }
         }
         if (dir == null) {
+            activeProvenance = null;
             registry.set(NerModelRegistry.disabled(storeDir, "没有找到识别模型"));
             if (explicitDir == null) {
                 state = State.NOT_INSTALLED;
@@ -635,6 +647,23 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
                 nextStep = "请检查该目录，或改用「安装随附模型」。";
             }
             return;
+        }
+        if (explicitDir == null) {
+            try {
+                activeProvenance = store.verifyActiveProvenance();
+            } catch (IOException e) {
+                activeProvenance = null;
+                registry.set(NerModelRegistry.disabled(dir,
+                        "模型签名来源无法复验：" + e.getMessage()));
+                state = State.BROKEN;
+                failure = "识别模型存在，但签名来源无法复验。";
+                nextStep = "请从已签名模型包重新安装。";
+                log("模型签名来源无法复验：" + e.getMessage());
+                return;
+            }
+        } else {
+            // --ner-model 是显式开发/排障入口：允许目录直载，但身份明确标成未验签。
+            activeProvenance = null;
         }
         NerModelPackage pkg;
         try {
@@ -663,11 +692,9 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
         }
         // 载入成功：注册表接管这份包，它随本对象一起关闭。
         registry.set(NerModelRegistry.enabled(pkg));
-        if (explicitDir == null) {
-            state = State.READY;
-            failure = null;
-            nextStep = null;
-        }
+        state = State.READY;
+        failure = null;
+        nextStep = null;
     }
 
     /**

@@ -285,6 +285,9 @@ class ModelPackageStoreTest {
         ModelPackageStore store = new ModelPackageStore(active);
         ModelPackageStore.InstallResult v1 = store.install(toyZip("模型-v1"));
         store.install(toyZip("模型-v2"));
+        Path receipt = receiptZip(v1.key());
+        assertTrue(Files.isRegularFile(receipt));
+        assertTrue(Files.isRegularFile(ModelTrust.signatureFileFor(receipt)));
 
         store.remove(v1.key());
 
@@ -293,6 +296,8 @@ class ModelPackageStoreTest {
         assertTrue(versions.get(0).active());
         assertEquals("模型-v2", versions.get(0).modelId());
         assertTrue(Files.isRegularFile(active.resolve("ner.onnx")), "当前生效的那份不能被动");
+        assertFalse(Files.exists(receipt), "删版本时也要清掉对应发布包收据");
+        assertFalse(Files.exists(ModelTrust.signatureFileFor(receipt)), "删版本时也要清掉对应签名收据");
     }
 
     @Test
@@ -300,11 +305,14 @@ class ModelPackageStoreTest {
     void removesActiveVersion() throws Exception {
         ModelPackageStore store = new ModelPackageStore(active);
         ModelPackageStore.InstallResult v1 = store.install(toyZip("模型-v1"));
+        Path receipt = receiptZip(v1.key());
 
         store.remove(v1.key());
 
         assertFalse(Files.exists(active), "生效目录被删掉了（= 卸载了模型包）");
         assertEquals(0, store.list().size(), "一个版本都不剩");
+        assertFalse(Files.exists(receipt), "卸载模型时也要清掉对应发布包收据");
+        assertFalse(Files.exists(ModelTrust.signatureFileFor(receipt)), "卸载模型时也要清掉对应签名收据");
     }
 
     @Test
@@ -611,6 +619,10 @@ class ModelPackageStoreTest {
         ModelPackageSignature.Envelope env = ModelPackageSignature.sign(
                 zip, signingKey.getPrivate(), ModelPackageSignature.keyIdOf(signingKey.getPublic()));
         Files.write(ModelTrust.signatureFileFor(zip), ModelPackageSignature.writeEnvelope(env));
+    }
+
+    private Path receiptZip(String key) {
+        return active.resolveSibling(active.getFileName() + ".receipts").resolve(key + ".zip");
     }
 
     private static boolean same(Path a, Path b) {
