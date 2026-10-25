@@ -124,26 +124,15 @@ public final class JobStore {
         this.identityProvider = identityProvider;
     }
 
-    /** 一个任务的全部状态。字段都是 final，除了 outputName（apply 之后才有）。 */
+    /** 一个任务的全部状态；所有跨字段变更都在该 job 的监视器内完成。 */
     public static final class Job {
         final String jobId;
         final String sourceName;
-        /**
-         * 预览件（scan 阶段的脱敏结果）的磁盘名。
-         *
-         * <p><b>不是 final 了</b>：用户补充敏感词之后要**重扫**，
-         * 预览件会换一份新的（见 {@link JobStore#rescan}）。
-         */
-        volatile String previewName;
         final String displayName;
         final String extension;
         final DocumentService.Format format;
-        /**
-         * 扫描结果。
-         *
-         * <p><b>不是 final 了</b>：同上，补词之后要重扫。
-         */
-        volatile DocumentService.Result scan;
+        /** 预览文件、命中、身份与修订号一次性发布，避免读到半新半旧的组合。 */
+        private volatile ScanSnapshot scanSnapshot;
         /**
          * 用户在这个任务上手工补充的敏感词。
          *
@@ -153,16 +142,6 @@ public final class JobStore {
          * 悄悄变成全局规则会让后面每一份文件都被它影响。
          */
         final List<String> userTerms = new ArrayList<>();
-        /**
-         * 这次是否启用了 AI 来源（NER）。
-         *
-         * <p>零命中时要**说清是哪一种零**：
-         * 「规则没命中」与「规则没命中且人名识别没开」对用户的意义完全不同
-         * —— 后者意味着文档里的人名**根本没被找过**。
-         */
-        volatile boolean nerEnabled;
-        /** 最近一次扫描/重扫实际使用的不可变工具与模型身份。 */
-        volatile ProcessingIdentity scanIdentity;
         /** 成品实际使用的身份；无排除项时与 scanIdentity 是同一个快照。 */
         volatile ProcessingIdentity appliedIdentity;
         volatile String outputName;
@@ -187,35 +166,6 @@ public final class JobStore {
         volatile boolean mappingSealed;
         volatile DocumentService.Result applied;
 
-        /**
-         * 是不是已经有人认领了这个任务的应用。
-         *
-         * <p>认领是<b>原子的</b>：以前 {@code apply} 整个方法都在监视器里，
-         * 两个并发请求只能一个先跑完、另一个看到「已经应用过了」。
-         * 现在重活跑在监视器外面，方法本身不再互斥，于是要靠这个标志把
-         * 「同一个任务被应用两次」挡住——否则两个请求会各写一份成品件，
-         * 而用户只看得见其中一份，另一份连同它的原值留在磁盘上。
-         */
-        private boolean applying;
-
-        /**
-         * 认领应用权。已经应用过、或别人正在应用，都拿不到。
-         *
-         * @return 拿不到时返回 false
-         */
-        synchronized boolean claimApply() {
-            if (outputName != null || applying) {
-                return false;
-            }
-            applying = true;
-            return true;
-        }
-
-        /** 释放应用权。失败也要释放——否则这次失败会让这个任务再也应用不了。 */
-        synchronized void releaseApply() {
-            applying = false;
-        }
-
         Job(String jobId, String sourceName, String previewName, String displayName,
             String extension, DocumentService.Format format, DocumentService.Result scan,
             boolean nerEnabled) {
@@ -229,13 +179,10 @@ public final class JobStore {
             ProcessingIdentity scanIdentity) {
             this.jobId = jobId;
             this.sourceName = sourceName;
-            this.previewName = previewName;
             this.displayName = displayName;
             this.extension = extension;
             this.format = format;
-            this.scan = scan;
-            this.scanIdentity = scanIdentity;
-            this.nerEnabled = scanIdentity.usedModel();
+            this.scanSnapshot = new ScanSnapshot(previewName, scan, scanIdentity, 1L);
         }
 
         public String jobId() {
@@ -244,6 +191,18 @@ public final class JobStore {
 
         public String displayName() {
             return displayName;
+        }
+
+        DocumentService.Result scan() {
+            return scanSnapshot.result();
+        }
+
+        ProcessingIdentity scanIdentity() {
+            return scanSnapshot.identity();
+        }
+
+        long scanRevision() {
+            return scanSnapshot.revision();
         }
 
         public String downloadName() {
@@ -289,7 +248,7 @@ public final class JobStore {
         }
 
         String previewNameForTest() {
-            return previewName;
+            return scanSnapshot.previewName();
         }
 
         String outputNameForTest() {
@@ -298,6 +257,10 @@ public final class JobStore {
 
         String mappingNameForTest() {
             return mappingName;
+        }
+
+        private record ScanSnapshot(String previewName, DocumentService.Result result,
+                                    ProcessingIdentity identity, long revision) {
         }
     }
 
@@ -457,27 +420,32 @@ public final class JobStore {
      */
     public Job addUserTerms(String jobId, List<String> terms) throws IOException {
         Job job = require(jobId);
-        if (job.outputName != null) {
-            throw new BadRequestException("这个文件已经应用过了；要改补充词请重新上传。");
-        }
-        List<String> cleaned;
-        try {
-            cleaned = com.litemask.core.UserTerms.validate(terms);
-        } catch (IllegalArgumentException e) {
-            throw new BadRequestException(e.getMessage());
-        }
-        boolean changed = false;
-        for (String t : cleaned) {
-            if (!job.userTerms.contains(t)) {
-                job.userTerms.add(t);
-                changed = true;
+        synchronized (job) {
+            if (job.outputName != null) {
+                throw new BadRequestException("这个文件已经应用过了；要改补充词请重新上传。");
             }
+            List<String> cleaned;
+            try {
+                cleaned = com.litemask.core.UserTerms.validate(terms);
+            } catch (IllegalArgumentException e) {
+                throw new BadRequestException(e.getMessage());
+            }
+            List<String> nextTerms = new ArrayList<>(job.userTerms);
+            boolean changed = false;
+            for (String t : cleaned) {
+                if (!nextTerms.contains(t)) {
+                    nextTerms.add(t);
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                throw new BadRequestException("这些词已经在本次处理里了。");
+            }
+            rescan(job, nextTerms);
+            job.userTerms.clear();
+            job.userTerms.addAll(nextTerms);
+            return job;
         }
-        if (!changed) {
-            throw new BadRequestException("这些词已经在本次处理里了。");
-        }
-        rescan(job);
-        return job;
     }
 
     /**
@@ -516,27 +484,25 @@ public final class JobStore {
      * <p><b>旧预览件必须删掉</b>：它里面是**没脱敏干净**的那一版
      * （补的词没生效），留在会话目录里就是一份含原值的文件没人认领。
      */
-    private void rescan(Job job) throws IOException {
+    private void rescan(Job job, List<String> terms) throws IOException {
+        Job.ScanSnapshot previous = job.scanSnapshot;
         String newPreview = workspace.newDiskName(job.extension);
         DocumentService.Result result;
         ProcessingIdentity identity;
         try (com.litemask.core.ExclusiveGate.Release release = gate.acquire()) {
             identity = captureIdentity();
             result = DocumentService.redact(workspace.pathOf(job.sourceName),
-                    workspace.pathOf(newPreview), job.format, rulesWithUserTerms(job),
+                    workspace.pathOf(newPreview), job.format, rulesWithUserTerms(terms),
                     Exclusions.NONE, sources);
         } catch (RuntimeException | IOException e) {
             // 半成品不能留在盘上
             workspace.delete(newPreview);
             throw e;
         }
-        String old = job.previewName;
-        job.previewName = newPreview;
-        job.scan = result;
-        job.scanIdentity = identity;
-        job.nerEnabled = identity.usedModel();
-        if (old != null) {
-            workspace.delete(old);
+        job.scanSnapshot = new Job.ScanSnapshot(
+                newPreview, result, identity, previous.revision() + 1);
+        if (previous.previewName() != null) {
+            workspace.delete(previous.previewName());
         }
     }
 
@@ -547,11 +513,15 @@ public final class JobStore {
      * 免得每次扫描都多分配一份一模一样的列表。
      */
     private List<Rule> rulesWithUserTerms(Job job) {
-        if (job.userTerms.isEmpty()) {
+        return rulesWithUserTerms(job.userTerms);
+    }
+
+    private List<Rule> rulesWithUserTerms(List<String> terms) {
+        if (terms.isEmpty()) {
             return rules;
         }
         List<Rule> all = new ArrayList<>(rules);
-        all.addAll(com.litemask.core.UserTerms.toRules(job.userTerms));
+        all.addAll(com.litemask.core.UserTerms.toRules(terms));
         return all;
     }
 
@@ -620,7 +590,7 @@ public final class JobStore {
             out.add(noText);
             return out;
         }
-        if (!job.nerEnabled) {
+        if (!job.scanIdentity().usedModel()) {
             out.add("规则没有命中。**人名与机构名识别未启用** —— "
                     + "文档里的人名与机构名**没有被找过**，"
                     + "不能据此认为这份文件里没有敏感信息。");
@@ -655,13 +625,11 @@ public final class JobStore {
     public Job apply(String jobId, Exclusions exclusions, char[] passphrase) throws IOException {
         Job job = require(jobId);
         Exclusions excl = exclusions == null ? Exclusions.NONE : exclusions;
-        if (!job.claimApply()) {
-            throw new BadRequestException("这个文件已经应用过了；要改排除项请重新上传");
-        }
-        try {
+        synchronized (job) {
+            if (job.outputName != null) {
+                throw new BadRequestException("这个文件已经应用过了；要改排除项请重新上传");
+            }
             return applyClaimed(job, excl, passphrase);
-        } finally {
-            job.releaseApply();
         }
     }
 
@@ -683,21 +651,15 @@ public final class JobStore {
             throws IOException {
         Job job = require(jobId);
         Exclusions excl = exclusions == null ? Exclusions.NONE : exclusions;
-        if (!job.claimApply()) {
-            throw new BadRequestException("这个文件已经应用过了；要改排除项请重新上传");
-        }
-        try {
+        synchronized (job) {
+            if (job.outputName != null) {
+                throw new BadRequestException("这个文件已经应用过了；要改排除项请重新上传");
+            }
             return TaskContext.in(ctx, () -> applyClaimed(job, excl, passphrase));
-        } finally {
-            job.releaseApply();
         }
     }
 
-    /**
-     * 已经「认领」了任务之后的应用逻辑。
-     *
-     * <p><b>重活（重跑脱敏）跑在监视器外面</b>，理由同 {@link #scanWith}。
-     */
+    /** 已持有该 job 监视器后的应用逻辑。 */
     private Job applyClaimed(Job job, Exclusions excl, char[] passphrase) throws IOException {
         verifyExclusionsMatch(job, excl);
         verifyGroupClosure(job, excl);
@@ -708,15 +670,15 @@ public final class JobStore {
         //   把它当「脱敏件」交给用户，就是在**掩盖未处理的内容**。
         //   → 直接拒掉，并说清要用户先做什么。
         if (job.format == DocumentService.Format.PDF) {
-            String noText = noTextLayerReason(job, job.scan);
+            String noText = noTextLayerReason(job, job.scan());
             if (noText != null) {
                 throw new BadRequestException(noText);
             }
         }
         if (excl.isEmpty()) {
-            job.outputName = job.previewName;
-            job.applied = job.scan;
-            job.appliedIdentity = job.scanIdentity;
+            job.outputName = job.scanSnapshot.previewName();
+            job.applied = job.scan();
+            job.appliedIdentity = job.scanIdentity();
         } else {
             String outName = workspace.newDiskName(job.extension);
             ProcessingIdentity identity;
@@ -871,7 +833,7 @@ public final class JobStore {
     private static void verifyExclusionsMatch(Job job, Exclusions exclusions) throws BadRequestException {
         for (Exclusions.HitRef ref : exclusions.hits()) {
             boolean known = false;
-            for (DocumentService.HitItem hit : job.scan.hits()) {
+            for (DocumentService.HitItem hit : job.scan().hits()) {
                 if (命中这个值(hit, ref)) {
                     if (ref.occurrence() == Exclusions.HitRef.ANY
                             || ref.occurrence() < hit.occurrences()) {
@@ -905,7 +867,7 @@ public final class JobStore {
      * 「只保留第 N 次出现」针对的是同一个值的不同出现处，与归组行无关。
      */
     private static void verifyGroupClosure(Job job, Exclusions exclusions) throws BadRequestException {
-        for (DocumentService.HitItem hit : job.scan.hits()) {
+        for (DocumentService.HitItem hit : job.scan().hits()) {
             if (hit.valueCount() < 2) {
                 continue;
             }
@@ -947,7 +909,7 @@ public final class JobStore {
             if (ref.occurrence() == Exclusions.HitRef.ANY) {
                 continue;                       // 值级：verifyGroupClosure 已经管了
             }
-            for (DocumentService.HitItem hit : job.scan.hits()) {
+            for (DocumentService.HitItem hit : job.scan().hits()) {
                 if (hit.valueCount() < 2) {
                     continue;
                 }
@@ -1050,7 +1012,7 @@ public final class JobStore {
         Job job = oldest.getValue();
         evicted++;
         workspace.delete(job.sourceName);
-        workspace.delete(job.previewName);
+        workspace.delete(job.scanSnapshot.previewName());
         workspace.delete(job.outputName);
         // 映射件同样含原值：留着它等于把用户文档里的原值留在磁盘上，
         // 而界面上早就看不见这个任务了。
@@ -1150,8 +1112,9 @@ public final class JobStore {
         out.put("formatLabel", job.format.label());
         out.put("fileName", job.displayName());
         out.put("downloadName", job.downloadName());
-        ProcessingIdentity identity = "applied".equals(stage) ? job.appliedIdentity : job.scanIdentity;
+        ProcessingIdentity identity = "applied".equals(stage) ? job.appliedIdentity : job.scanIdentity();
         out.put("toolIdentity", identityMap(identity));
+        out.put("processingRevision", job.scanRevision());
         if (job.mappingName != null) {
             // 只有应用过才有映射件与还原件。scan 阶段报这两个名字会让界面
             // 以为「现在就能下载映射」——那时候点下去只会拿到一个 400。

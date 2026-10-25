@@ -272,7 +272,7 @@ class HitGroupingServiceTest {
         try {
             JobStore.Job job = jobs.scan("a.txt",
                     "备用 a.b@x.cn 联系人".getBytes(StandardCharsets.UTF_8));
-            assertEquals(1, job.scan.hits().size(), "扫描结果应当是归成的一行");
+            assertEquals(1, job.scan().hits().size(), "扫描结果应当是归成的一行");
 
             // 只排除 3 个成员里的 1 个
             Exclusions 半行 = Exclusions.ofList(List.of(

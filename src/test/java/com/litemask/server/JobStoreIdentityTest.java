@@ -39,13 +39,13 @@ class JobStoreIdentityTest {
                     List.of(activeSource()), com.litemask.core.ExclusiveGate.NONE, current::get);
 
             JobStore.Job jobA = jobs.scan("a.txt", sample());
-            assertIdentity(JobStore.describe(jobA, jobA.scan, "scanned", 0), MODEL_A);
+            assertIdentity(JobStore.describe(jobA, jobA.scan(), "scanned", 0), MODEL_A);
 
             current.set(MODEL_B);
-            assertIdentity(JobStore.describe(jobA, jobA.scan, "scanned", 0), MODEL_A);
+            assertIdentity(JobStore.describe(jobA, jobA.scan(), "scanned", 0), MODEL_A);
 
             jobs.addUserTerms(jobA.jobId(), List.of("合同"));
-            assertIdentity(JobStore.describe(jobA, jobA.scan, "scanned", 0), MODEL_B);
+            assertIdentity(JobStore.describe(jobA, jobA.scan(), "scanned", 0), MODEL_B);
 
             current.set(MODEL_A);
             JobStore.Job reused = jobs.apply(jobA.jobId(), Exclusions.NONE);
@@ -70,7 +70,7 @@ class JobStoreIdentityTest {
             JobStore jobs = new JobStore(ws, RuleLoader.loadFromClasspath("rules/core-rules.json"),
                     List.of(activeSource()), com.litemask.core.ExclusiveGate.NONE, current::get);
             JobStore.Job job = jobs.scan("dev.txt", sample());
-            Map<String, Object> identity = identityOf(JobStore.describe(job, job.scan, "scanned", 0));
+            Map<String, Object> identity = identityOf(JobStore.describe(job, job.scan(), "scanned", 0));
             assertEquals("developer-model", identity.get("modelId"));
             assertEquals(false, identity.get("signatureVerified"));
             assertEquals(false, identity.get("strictProductionEligible"));

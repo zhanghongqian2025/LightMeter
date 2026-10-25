@@ -188,11 +188,11 @@ class PositionExclusionTest {
             byte[] body = "备用 a.b@x.cn 联系人".getBytes(StandardCharsets.UTF_8);
             JobStore.Job job = jobs.scan("m.txt", body);
 
-            DocumentService.HitItem merged = job.scan.hits().stream()
+            DocumentService.HitItem merged = job.scan().hits().stream()
                     .filter(h -> h.valueCount() > 1)
                     .findFirst()
                     .orElseThrow(() -> new AssertionError(
-                            "前提：应当有一个归组行，实际命中: " + job.scan.hits()));
+                            "前提：应当有一个归组行，实际命中: " + job.scan().hits()));
             DocumentService.HitItem.Member member = merged.members().get(0);
 
             JobStore.BadRequestException e = assertThrows(JobStore.BadRequestException.class,
@@ -212,7 +212,7 @@ class PositionExclusionTest {
             byte[] body = "备用 a.b@x.cn 联系人".getBytes(StandardCharsets.UTF_8);
             JobStore.Job job = jobs.scan("m2.txt", body);
 
-            DocumentService.HitItem merged = job.scan.hits().stream()
+            DocumentService.HitItem merged = job.scan().hits().stream()
                     .filter(h -> h.valueCount() > 1)
                     .findFirst()
                     .orElseThrow(() -> new AssertionError("前提：应当有一个归组行"));

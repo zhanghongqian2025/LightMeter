@@ -53,14 +53,14 @@ class JobStoreNerWiringTest {
             JobStore jobs = new JobStore(ws, rules());
             JobStore.Job job = jobs.scan("plain.txt", sampleBytes("plain.txt"));
 
-            assertFalse(job.scan.mapping().containsKey("<人名1>"));
-            assertTrue(String.join(" | ", job.scan.notes()).contains("人名与机构名没有被脱敏"),
+            assertFalse(job.scan().mapping().containsKey("<人名1>"));
+            assertTrue(String.join(" | ", job.scan().notes()).contains("人名与机构名没有被脱敏"),
                     "没接 NER 却不说，用户会拿这份文件当脱敏过的传出去");
             // 前提断言：正则那条通路必须先工作，否则「没脱人名」可能只是
             // 「整条管线根本没跑」。「没有 hits 就跳过」是最容易把测试变成永真的一种写法。
-            assertTrue(job.scan.mapping().containsKey("<手机号1>"),
+            assertTrue(job.scan().mapping().containsKey("<手机号1>"),
                     "前提：手机号应当被正则脱敏");
-            assertFalse(job.scan.hits().isEmpty(),
+            assertFalse(job.scan().hits().isEmpty(),
                     "前提：没接来源时也应当至少命中一条规则");
             // 更硬的一条：直接读回预览件，确认「张三」真的还在文件里。
             // 映射表为空不排除命中被丢弃的可能，文件内容才是最终用户拿到的东西。
@@ -86,11 +86,11 @@ class JobStoreNerWiringTest {
             JobStore jobs = new JobStore(ws, rules(), List.of(fakeNer()));
             JobStore.Job job = jobs.scan("ner.txt", sampleBytes("ner.txt"));
 
-            assertTrue(job.scan.hits().stream()
+            assertTrue(job.scan().hits().stream()
                             .anyMatch(h -> h.ruleKey().equals(NerEntitySource.RULE_PERSON)),
                     "服务端路径也要真的脱掉人名，不能只在 CLI 里生效");
-            assertTrue(job.scan.mapping().containsKey("<人名1>"));
-            assertFalse(String.join(" | ", job.scan.notes()).contains("没有被脱敏"),
+            assertTrue(job.scan().mapping().containsKey("<人名1>"));
+            assertFalse(String.join(" | ", job.scan().notes()).contains("没有被脱敏"),
                     "带了来源就不该再说「人名没被脱」");
             正则通路仍然命中(job);
 
@@ -113,7 +113,7 @@ class JobStoreNerWiringTest {
      * 单独断言 {@code phone} 仍然命中，才能把「NER 生效」与「正则仍生效」分开看。
      */
     private static void 正则通路仍然命中(JobStore.Job job) {
-        assertTrue(job.scan.hits().stream()
+        assertTrue(job.scan().hits().stream()
                         .anyMatch(h -> h.ruleKey().equals("phone")),
                 "NER 与正则必须都命中——共用通路不代表只能走一条");
     }

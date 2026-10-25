@@ -403,7 +403,7 @@ public final class TaskRunner implements AutoCloseable {
         try {
             JobStore.Job job = jobs.scanStaged(staged, task.context);
             task.jobId = job.jobId();
-            task.payload = JobStore.describe(job, job.scan, "scanned", 0);
+            task.payload = JobStore.describe(job, job.scan(), "scanned", 0);
             task.status = Status.DONE;
             task.message = "扫描完成";
         } catch (TaskContext.CanceledException e) {

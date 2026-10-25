@@ -246,7 +246,7 @@ public final class ApiHandlers {
     private static void scan(HttpExchange ex, JobStore jobs) throws IOException {
         try {
             JobStore.Job job = jobs.scan(ex);
-            Http.json(ex, 200, JobStore.describe(job, job.scan, "scanned", 0));
+            Http.json(ex, 200, JobStore.describe(job, job.scan(), "scanned", 0));
         } catch (JobStore.BadRequestException e) {
             Http.json(ex, 400, Map.of("ok", false, "error", e.getMessage()));
         }
@@ -266,7 +266,7 @@ public final class ApiHandlers {
             JobStore.Job job = jobs.addUserTerms(req.jobId(), req.terms());
             // 重扫之后，命中清单变了 → 界面要整体重画，
             // 所以回的是**完整的 scan 形状**（与 /api/scan 同一个 describe）。
-            Http.json(ex, 200, JobStore.describe(job, job.scan, "scanned", 0));
+            Http.json(ex, 200, JobStore.describe(job, job.scan(), "scanned", 0));
         } catch (JobStore.BadRequestException e) {
             Http.json(ex, 400, Map.of("ok", false, "error", e.getMessage()));
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
