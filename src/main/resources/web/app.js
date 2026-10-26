@@ -30,6 +30,8 @@
     pendingDownloads: 0,
     productDownloaded: false,
     mappingDownloaded: false,
+    restoreImportOperation: null,
+    shutdownPending: false,
     stopping: false,
     // 用户手工补充的敏感词（本次处理内有效）。
     // 服务端会把它回传，这里存一份只是为了在重扫后还能显示出来。
@@ -1177,8 +1179,26 @@
 
   // -------------------------------------------------------- 重启后独立还原
 
+  function currentRestoreImport(op) {
+    return state.restoreImportOperation === op;
+  }
+
+  function lockRestoreImportControls(locked) {
+    $("restoreProductFile").disabled = locked;
+    $("restoreMappingFile").disabled = locked;
+    $("restorePass").disabled = locked;
+    if (locked) {
+      $("restoreImportBtn").disabled = true;
+    }
+  }
+
   function updateRestoreImportReady() {
     if (state.stopping) { return; }
+    if (state.restoreImportOperation || state.shutdownPending) {
+      lockRestoreImportControls(true);
+      return;
+    }
+    lockRestoreImportControls(false);
     var product = $("restoreProductFile").files[0];
     var mapping = $("restoreMappingFile").files[0];
     var passphrase = $("restorePass").value || "";
@@ -1190,7 +1210,62 @@
   });
   $("restorePass").addEventListener("input", updateRestoreImportReady);
 
+  function finishRestoreImport(op) {
+    if (!currentRestoreImport(op) || !op.uploadSettled || !op.cancelSettled) { return; }
+    state.restoreImportOperation = null;
+    $("restoreImportBtn").textContent = "核对并还原";
+    $("restoreImportCancelBtn").hidden = true;
+    if (state.stopping || state.shutdownPending) { return; }
+    if (op.cancelRequested) {
+      $("restoreImportStatus").textContent = op.cancelError
+        ? "本机上传已停止，但服务端取消请求失败；请确认服务仍可用后再重试。"
+        : "已取消，本次未生成还原文件，可以重新选择后再试。";
+    }
+    updateRestoreImportReady();
+  }
+
+  function cancelRestoreImport(op, forShutdown) {
+    if (!op || !currentRestoreImport(op) || op.cancelRequested) {
+      return op ? op.cancelPromise : Promise.resolve();
+    }
+    op.cancelRequested = true;
+    op.cancelSettled = false;
+    op.controller.abort();
+    $("restoreImportCancelBtn").disabled = true;
+    if (!forShutdown) {
+      $("restoreImportStatus").textContent =
+        "正在取消原上传，并通知本机服务清理；完成前不会开始下一次还原。";
+    }
+    op.cancelPromise = fetch("/api/restore-import-cancel", {
+      method: "POST",
+      headers: headers()
+    })
+      .then(function (r) {
+        return r.json().then(function (body) {
+          if (!r.ok) {
+            throw new Error(body && body.error ? body.error : ("服务返回 " + r.status));
+          }
+          return body;
+        });
+      })
+      .then(function (result) {
+        if (!currentRestoreImport(op) || state.stopping || forShutdown) { return; }
+        $("restoreImportStatus").textContent = result.message || "已请求取消，正在等待原上传结束。";
+      })
+      .catch(function (e) {
+        op.cancelError = e;
+        if (!currentRestoreImport(op) || state.stopping || forShutdown) { return; }
+        showError("restoreImportError", "取消请求失败：" + e.message);
+      })
+      .finally(function () {
+        op.cancelSettled = true;
+        finishRestoreImport(op);
+      });
+    return op.cancelPromise;
+  }
+
   $("restoreImportBtn").addEventListener("click", function () {
+    if (state.restoreImportOperation || state.shutdownPending || state.stopping) { return; }
     var product = $("restoreProductFile").files[0];
     var mapping = $("restoreMappingFile").files[0];
     var passphrase = $("restorePass").value || "";
@@ -1198,7 +1273,16 @@
 
     var btn = $("restoreImportBtn");
     var cancelBtn = $("restoreImportCancelBtn");
-    btn.disabled = true;
+    var op = {
+      controller: new AbortController(),
+      uploadSettled: false,
+      cancelRequested: false,
+      cancelSettled: true,
+      cancelPromise: null,
+      cancelError: null
+    };
+    state.restoreImportOperation = op;
+    lockRestoreImportControls(true);
     state.pendingDownloads += 1;
     btn.textContent = "核对并还原中…";
     cancelBtn.hidden = false;
@@ -1227,9 +1311,11 @@
     fetch("/api/restore-import", {
       method: "POST",
       headers: headers({ "Content-Type": "application/octet-stream" }),
-      body: envelope
+      body: envelope,
+      signal: op.controller.signal
     })
       .then(function (r) {
+        if (!currentRestoreImport(op) || op.cancelRequested || state.stopping) { return null; }
         if (!r.ok) {
           return r.json().then(function (j) {
             throw new Error(j && j.error ? j.error : ("服务返回 " + r.status));
@@ -1244,7 +1330,7 @@
         });
       })
       .then(function (result) {
-        if (state.stopping) { return; }
+        if (!result || !currentRestoreImport(op) || op.cancelRequested || state.stopping) { return; }
         var lower = product.name.toLowerCase();
         var dot = lower.lastIndexOf(".");
         var name = dot > 0
@@ -1264,34 +1350,22 @@
           + (result.notice ? decodeURIComponent(result.notice).split(" | ").join("；") : "");
       })
       .catch(function (e) {
-        if (state.stopping) { return; }
+        if (!currentRestoreImport(op) || op.cancelRequested || state.stopping
+            || (e && e.name === "AbortError")) { return; }
         $("restoreImportStatus").textContent = "未生成还原文件。";
         showError("restoreImportError", "还原失败：" + e.message);
       })
       .finally(function () {
-        state.pendingDownloads = Math.max(0, state.pendingDownloads - 1);
-        if (state.stopping) { return; }
-        btn.textContent = "核对并还原";
-        cancelBtn.hidden = true;
-        updateRestoreImportReady();
+        if (!op.uploadSettled) {
+          op.uploadSettled = true;
+          state.pendingDownloads = Math.max(0, state.pendingDownloads - 1);
+        }
+        finishRestoreImport(op);
       });
   });
 
   $("restoreImportCancelBtn").addEventListener("click", function () {
-    var btn = $("restoreImportCancelBtn");
-    btn.disabled = true;
-    $("restoreImportStatus").textContent = "正在请求取消；本地格式处理会在下一个安全检查点停下。";
-    fetch("/api/restore-import-cancel", { method: "POST", headers: headers() })
-      .then(function (r) { return r.json(); })
-      .then(function (result) {
-        if (state.stopping) { return; }
-        $("restoreImportStatus").textContent = result.message || "已请求取消。";
-      })
-      .catch(function (e) {
-        if (state.stopping) { return; }
-        showError("restoreImportError", "取消失败：" + e.message);
-        btn.disabled = false;
-      });
+    cancelRestoreImport(state.restoreImportOperation, false);
   });
 
   $("againBtn").addEventListener("click", function () {
@@ -1379,8 +1453,10 @@
   }
 
   $("shutdownBtn").addEventListener("click", function () {
-    if (state.stopping) { return; }
-    if (state.pendingDownloads > 0) {
+    if (state.shutdownPending || state.stopping) { return; }
+    var activeImportUpload = state.restoreImportOperation
+      && !state.restoreImportOperation.uploadSettled ? 1 : 0;
+    if (state.pendingDownloads - activeImportUpload > 0) {
       $("shutdownStatus").textContent = "还有文件正在下载，请等下载结束后再退出。";
       return;
     }
@@ -1397,6 +1473,12 @@
       $("shutdownStatus").textContent = "已取消退出，本机服务仍可继续使用。";
       return;
     }
+
+    // 独立还原的上传属于本页，退出时先切断这个请求；服务端取消仍照常发送。
+    // 普通成品下载不这样做：浏览器正在保存的文件不能被静默截断。
+    state.shutdownPending = true;
+    lockRestoreImportControls(true);
+    cancelRestoreImport(state.restoreImportOperation, true);
 
     var btn = $("shutdownBtn");
     btn.disabled = true;
@@ -1420,8 +1502,10 @@
         lockControlsForStop();
       })
       .catch(function (e) {
+        state.shutdownPending = false;
         btn.disabled = false;
         btn.textContent = "退出本机服务";
+        updateRestoreImportReady();
         showError("shutdownError", "退出请求失败：" + e.message
           + "。本机服务尚未被确认停止。");
       });

@@ -716,6 +716,8 @@ class WebUiTest {
         assertTrue(js.contains("application/octet-stream"), "应使用有界二进制信封");
         assertTrue(js.contains("fetch(\"/api/restore-import-cancel\""),
                 "同步还原必须能用另一条 HTTP 线程请求协作取消");
+        assertTrue(js.contains("new AbortController()") && js.contains("signal: op.controller.signal"),
+                "取消必须中止本次页面持有的原上传，不能只给服务端打取消标记");
         assertTrue(js.contains("addEventListener(\"click\""),
                 "选文件时不得自动上传，只有点按钮才发请求");
         assertTrue(js.contains("restorePass\").value = \"\""), "口令用完应从输入框清掉");
@@ -735,7 +737,10 @@ class WebUiTest {
         }
         assertTrue(html.contains("脱敏文件和映射文件都已保存"),
                 "退出前必须明确提醒同时保存成品与映射");
-        assertTrue(js.contains("state.pendingDownloads > 0"), "文件正在下载时必须阻止退出");
+        assertTrue(js.contains("state.pendingDownloads - activeImportUpload > 0"),
+                "普通文件正在下载时必须阻止退出；本页持有的还原上传应走取消后退出");
+        assertTrue(js.contains("cancelRestoreImport(state.restoreImportOperation, true)"),
+                "退出时应中止本页持有的独立还原上传并通知服务端取消");
         assertTrue(js.contains("window.confirm"), "退出必须二次确认");
         assertTrue(js.contains("已取消退出，本机服务仍可继续使用"),
                 "用户取消后应明说服务仍可用");
