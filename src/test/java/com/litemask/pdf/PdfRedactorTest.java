@@ -1,8 +1,10 @@
 package com.litemask.pdf;
 
 import com.litemask.core.Change;
+import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
 import com.litemask.core.RuleLoader;
+import com.litemask.server.DocumentService;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.encryption.StandardProtectionPolicy;
@@ -69,6 +71,17 @@ class PdfRedactorTest {
             + "(" + IP + " is the gateway) Tj\n"
             + "(Trailing text) Tj\n"
             + "ET\n";
+
+    @Test
+    @DisplayName("DocumentService 结果如实提示 PDF 图片像素不受影响")
+    void coverageNoteIsReturned(@TempDir Path dir) throws IOException {
+        Path in = PdfFixtures.writeLatin(dir.resolve("coverage.pdf"), SAMPLE);
+        DocumentService.Result result = DocumentService.redact(in, dir.resolve("coverage-out.pdf"),
+                DocumentService.Format.PDF, rules, Exclusions.NONE);
+        String notes = String.join(" | ", result.notes());
+        assertTrue(notes.contains("图文混排") && notes.contains("OCR 文本")
+                        && notes.contains("图片像素") && notes.contains("深层对象"), notes);
+    }
 
     // ---------------------------------------------------------------- 主干
 

@@ -1,7 +1,10 @@
 package com.litemask.ofd;
 
 import com.litemask.core.Rule;
+import com.litemask.core.Exclusions;
 import com.litemask.core.RuleLoader;
+import com.litemask.server.DocumentService;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -33,6 +36,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class OfdRedactorTest {
 
     private static final List<Rule> RULES = RuleLoader.loadFromClasspath("rules/core-rules.json");
+
+    @Test
+    @DisplayName("DocumentService 结果如实提示 OFD 图片与附件内容未覆盖")
+    void coverageNoteIsReturned() throws Exception {
+        Path dir = tmp();
+        Path in = OfdFixtures.standard(dir, "coverage.ofd");
+        DocumentService.Result result = DocumentService.redact(in, dir.resolve("coverage-out.ofd"),
+                DocumentService.Format.OFD, RULES, Exclusions.NONE);
+        String notes = String.join(" | ", result.notes());
+        assertTrue(notes.contains("图片像素") && notes.contains("附件文件的内容")
+                        && notes.contains("附件改名不等于"), notes);
+    }
 
     // ------------------------------------------------------------------ 正文
 

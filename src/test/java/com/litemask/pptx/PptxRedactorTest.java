@@ -1,8 +1,10 @@
 package com.litemask.pptx;
 
 import com.litemask.core.RedactionEngine;
+import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
 import com.litemask.core.RuleLoader;
+import com.litemask.server.DocumentService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -47,6 +49,18 @@ class PptxRedactorTest {
         Path out = dir.resolve(name.replace(".pptx", "-脱敏.pptx"));
         PptxRedactor.redact(in, out, RULES);
         return out;
+    }
+
+    @Test
+    @DisplayName("DocumentService 结果如实提示 PowerPoint 嵌入内容未覆盖")
+    void coverageNoteIsReturned() throws IOException {
+        Path in = new PptxFixture().slide(PptxFixture.shape(PptxFixture.paragraph("电话 " + CARD)))
+                .writeTo(dir, "coverage.pptx");
+        DocumentService.Result result = DocumentService.redact(in, dir.resolve("coverage-out.pptx"),
+                DocumentService.Format.PPTX, RULES, Exclusions.NONE);
+        String notes = String.join(" | ", result.notes());
+        assertTrue(notes.contains("图片像素") && notes.contains("嵌入工作簿")
+                        && notes.contains("OLE") && notes.contains("原始数据源"), notes);
     }
 
     @Test

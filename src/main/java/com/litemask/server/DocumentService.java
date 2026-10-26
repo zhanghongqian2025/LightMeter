@@ -333,6 +333,7 @@ public final class DocumentService {
                     "枚举新增了成员但这里没接上: " + format
                             + "。这是代码缺陷，不是用户输入的问题。");
         }
+        addCoverageNote(format, notes);
         // NER 状态必须进 notes，不能只进 stats：
         // stats 是给界面看的数字，notes 才是用户真正会读到的句子。
         // 「0 处」与「没装模型所以人名没脱」在数字上长得一模一样，
@@ -355,6 +356,34 @@ public final class DocumentService {
                     + "如需处理，请在界面的「识别模型」一栏里安装模型。");
         }
         return new Result(format, aggregate(raws, notes), raws.size(), mapping, notes, stats);
+    }
+
+    /**
+     * 各格式的处理边界。这是每次结果都必须带回界面的产品事实，
+     * 不能只写在帮助页：用户正在决定「这份文件能不能交出去」的时候才最需要它。
+     */
+    private static void addCoverageNote(Format format, List<String> notes) {
+        String note = switch (format) {
+            case DOCX -> "Word 本次处理的是已覆盖的文本与明确属性。"
+                    + "图片像素、嵌入文件、域代码（field codes）与其他未明确覆盖的属性不会改写，"
+                    + "不能据此认为所有隐藏信息已清除。";
+            case XLSX -> "Excel 本次处理的是已覆盖的单元格、名称、批注与属性。"
+                    + "图片像素、嵌入对象、公式源文本与图表缓存不在处理范围，"
+                    + "不能据此认为工作簿的所有隐藏内容已清除。";
+            case PPTX -> "PowerPoint 本次处理的是已覆盖的文本、备注、属性和图表缓存。"
+                    + "图片像素、嵌入工作簿与 OLE 对象不会改写；"
+                    + "即使图表缓存已修改，也不代表嵌入的原始数据源已处理。";
+            case PDF -> "PDF 本次处理的是可解析文本层与已明确覆盖的隐藏条目。"
+                    + "图片像素不会改变：扫描件、图文混排 PDF 和带 OCR 文本层的 PDF 都一样，"
+                    + "脱掉 OCR 文本不等于涂黑底下的图片。"
+                    + "未明确覆盖的深层对象也不做全文档已清理保证。";
+            case OFD -> "OFD 本次处理的是文本对象、已覆盖属性、附件名与签章条目。"
+                    + "图片像素和附件文件的内容不会改写；附件改名不等于附件内容已脱敏。";
+            case TXT -> null;
+        };
+        if (note != null) {
+            notes.add(note);
+        }
     }
 
     /**

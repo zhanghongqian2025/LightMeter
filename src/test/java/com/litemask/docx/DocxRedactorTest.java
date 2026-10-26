@@ -1,8 +1,10 @@
 package com.litemask.docx;
 
 import com.litemask.core.RedactionEngine;
+import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
 import com.litemask.core.RuleLoader;
+import com.litemask.server.DocumentService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -48,6 +50,18 @@ class DocxRedactorTest {
         Path out = dir.resolve(name.replace(".docx", "-脱敏.docx"));
         DocxRedactor.redact(in, out, RULES);
         return out;
+    }
+
+    @Test
+    @DisplayName("DocumentService 结果如实提示 Word 未覆盖内容")
+    void coverageNoteIsReturned() throws IOException {
+        Path in = DocxFixture.simple(DocxFixture.paragraph(DocxFixture.run(null, "电话 " + CARD)))
+                .writeTo(dir, "coverage.docx");
+        DocumentService.Result result = DocumentService.redact(in, dir.resolve("coverage-out.docx"),
+                DocumentService.Format.DOCX, RULES, Exclusions.NONE);
+        String notes = String.join(" | ", result.notes());
+        assertTrue(notes.contains("图片像素") && notes.contains("嵌入文件")
+                        && notes.contains("域代码") && notes.contains("未明确覆盖的属性"), notes);
     }
 
     @Test

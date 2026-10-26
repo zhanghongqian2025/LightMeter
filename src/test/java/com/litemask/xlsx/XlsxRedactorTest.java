@@ -1,8 +1,10 @@
 package com.litemask.xlsx;
 
 import com.litemask.core.RedactionEngine;
+import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
 import com.litemask.core.RuleLoader;
+import com.litemask.server.DocumentService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -46,6 +48,19 @@ class XlsxRedactorTest {
         Path out = dir.resolve(name.replace(".xlsx", "-脱敏.xlsx"));
         XlsxRedactor.redact(in, out, RULES);
         return out;
+    }
+
+    @Test
+    @DisplayName("DocumentService 结果如实提示 Excel 未覆盖内容")
+    void coverageNoteIsReturned() throws IOException {
+        Path in = new XlsxFixture().sharedStrings("电话 " + CARD).sheetData(
+                "<row r=\"1\">" + XlsxFixture.sharedCell("A1", 0) + "</row>")
+                .writeTo(dir, "coverage.xlsx");
+        DocumentService.Result result = DocumentService.redact(in, dir.resolve("coverage-out.xlsx"),
+                DocumentService.Format.XLSX, RULES, Exclusions.NONE);
+        String notes = String.join(" | ", result.notes());
+        assertTrue(notes.contains("图片像素") && notes.contains("嵌入对象")
+                        && notes.contains("公式源文本") && notes.contains("图表缓存"), notes);
     }
 
     @Test
