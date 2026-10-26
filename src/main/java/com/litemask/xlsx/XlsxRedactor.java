@@ -9,6 +9,7 @@ import com.litemask.core.RedactionResult;
 import com.litemask.core.RedactionSession;
 import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
+import com.litemask.core.TaskContext;
 import com.litemask.core.SlotTextMapper;
 import com.litemask.core.TextPlan;
 import com.litemask.ooxml.DocPropsScrubber;
@@ -141,6 +142,7 @@ public final class XlsxRedactor {
             Map<String, byte[]> changed = new LinkedHashMap<>();
             int restored = 0;
             for (ZipEntry entry : pkg.entries()) {
+                TaskContext.current().checkCancelled();
                 if (!isProcessablePart(entry.getName())) {
                     continue;
                 }
@@ -148,6 +150,7 @@ public final class XlsxRedactor {
                 boolean dirty = false;
                 NodeList textNodes = doc.getElementsByTagNameNS(S_NS, "t");
                 for (int i = 0; i < textNodes.getLength(); i++) {
+                    TaskContext.current().checkCancelled();
                     Element node = (Element) textNodes.item(i);
                     String back = RedactionEngine.restore(node.getTextContent(), mapping);
                     if (!back.equals(node.getTextContent())) {
@@ -158,6 +161,7 @@ public final class XlsxRedactor {
                 }
                 NodeList values = doc.getElementsByTagNameNS(S_NS, "v");
                 for (int i = 0; i < values.getLength(); i++) {
+                    TaskContext.current().checkCancelled();
                     Element node = (Element) values.item(i);
                     String back = RedactionEngine.restore(node.getTextContent(), mapping);
                     if (!back.equals(node.getTextContent())) {

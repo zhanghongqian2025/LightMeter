@@ -3,6 +3,7 @@ package com.litemask.server;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.litemask.core.Rule;
 import com.litemask.core.SecretMap;
+import com.litemask.ofd.OfdFixtures;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
@@ -10,11 +11,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.ByteArrayInputStream;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -24,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
+import java.util.zip.ZipInputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -33,7 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RestoreImportTest {
 
     private static final String PASSPHRASE = "fresh-process-口令";
-    private static final String ORIGINAL = "联系人张三，电话 13800138000\n";
+    private static final String ORIGINAL = "模板原有 <手机号999999999>；联系人张三，电话 13800138000\n";
 
     private static byte[] product;
     private static byte[] mapping;
@@ -73,6 +77,8 @@ class RestoreImportTest {
             product = LocalServerApiTest.Raw.bodyBytes(oldPort, "GET",
                     "/api/download?jobId=" + jobId, "127.0.0.1:" + oldPort,
                     null, oldToken, Map.of());
+            // 分配器从原文的最大编号之后继续；合法新编号可能超过原文识别式的九位。
+            assertTrue(new String(product, StandardCharsets.UTF_8).contains("<手机号1000000000>"));
             mapping = LocalServerApiTest.Raw.bodyBytes(oldPort, "GET",
                     "/api/mapping?jobId=" + jobId, "127.0.0.1:" + oldPort,
                     null, oldToken, Map.of());
@@ -135,6 +141,79 @@ class RestoreImportTest {
         assertEquals(200, response.status(), response.body());
         assertEquals(new String(zeroProduct, StandardCharsets.UTF_8), response.body());
         assertEquals("0", response.headers().get("x-litemask-restored").get(0));
+    }
+
+    @Test
+    @DisplayName("OFD 全角附件名令牌可跨新服务导入还原")
+    void ofdAttachmentFilenameRestoresInFreshWorkspace(@TempDir Path tmp) throws Exception {
+        Path source = OfdFixtures.standard(tmp, "attachment.ofd");
+        byte[] redacted;
+        byte[] encryptedMap;
+
+        try (Workspace producerWorkspace = Workspace.open(tmp.resolve("ofd-producer"))) {
+            LocalServer producer = LocalServer.create(producerWorkspace, 0);
+            ApiHandlers.register(producer, producerWorkspace, ApiHandlers.defaultRules());
+            producer.start();
+            try {
+                int producerPort = producer.port();
+                String producerToken = producer.policy().token();
+                LocalServerApiTest.Raw.Res scan = LocalServerApiTest.Raw.req(producerPort,
+                        "POST", "/api/scan", "127.0.0.1:" + producerPort, null, producerToken,
+                        Files.readAllBytes(source), Map.of(
+                                "Content-Type", "application/octet-stream",
+                                ApiHandlers.FILENAME_HEADER, "attachment.ofd"));
+                assertEquals(200, scan.status(), scan.body());
+                String jobId = Json.mapper().readTree(scan.body()).get("jobId").asText();
+
+                LocalServerApiTest.Raw.Res apply = LocalServerApiTest.Raw.req(producerPort,
+                        "POST", "/api/apply", "127.0.0.1:" + producerPort, null, producerToken,
+                        Json.toBytes(Map.of("jobId", jobId, "excluded", List.of(),
+                                "mapPassphrase", PASSPHRASE)),
+                        Map.of("Content-Type", "application/json"));
+                assertEquals(200, apply.status(), apply.body());
+                redacted = LocalServerApiTest.Raw.bodyBytes(producerPort, "GET",
+                        "/api/download?jobId=" + jobId, "127.0.0.1:" + producerPort,
+                        null, producerToken, Map.of());
+                encryptedMap = LocalServerApiTest.Raw.bodyBytes(producerPort, "GET",
+                        "/api/mapping?jobId=" + jobId, "127.0.0.1:" + producerPort,
+                        null, producerToken, Map.of());
+            } finally {
+                producer.close();
+            }
+        }
+
+        Map<String, byte[]> redactedEntries = unzip(redacted);
+        assertTrue(redactedEntries.keySet().stream().anyMatch(
+                        name -> name.startsWith("Doc_0/Attachs/［") && name.endsWith("］_申请书.pdf")),
+                "生产者没有写出 OFD 全角附件名令牌: " + redactedEntries.keySet());
+
+        byte[] restored;
+        try (Workspace consumerWorkspace = Workspace.open(tmp.resolve("ofd-consumer"))) {
+            LocalServer consumer = LocalServer.create(consumerWorkspace, 0);
+            ApiHandlers.register(consumer, consumerWorkspace, ApiHandlers.defaultRules());
+            consumer.start();
+            try {
+                byte[] envelope = restoreRequest(redacted, encryptedMap, PASSPHRASE, 1,
+                        "attachment.redacted.ofd", "attachment.ofd.redacted.map.json");
+                restored = LocalServerApiTest.Raw.bodyBytes(consumer.port(), "POST",
+                        "/api/restore-import", "127.0.0.1:" + consumer.port(), null,
+                        consumer.policy().token(), envelope,
+                        Map.of("Content-Type", "application/octet-stream"));
+            } finally {
+                consumer.close();
+            }
+        }
+
+        Map<String, byte[]> restoredEntries = unzip(restored);
+        String attachmentName = "Doc_0/Attachs/" + OfdFixtures.PHONE + "_申请书.pdf";
+        assertTrue(restoredEntries.containsKey(attachmentName),
+                "独立还原没有恢复附件名: " + restoredEntries.keySet());
+        assertEquals("fake-pdf-bytes",
+                new String(restoredEntries.get(attachmentName), StandardCharsets.UTF_8),
+                "附件二进制内容不得丢失");
+        assertTrue(new String(restoredEntries.get("Doc_0/Attachments.xml"), StandardCharsets.UTF_8)
+                        .contains("/Doc_0/Attachs/" + OfdFixtures.PHONE + "_申请书.pdf"),
+                "附件引用没有与条目名一起恢复");
     }
 
     @Test
@@ -219,18 +298,36 @@ class RestoreImportTest {
                 oversized.array(), Map.of("Content-Type", "application/octet-stream"));
         assertEquals(400, tooLarge.status(), tooLarge.body());
         assertTrue(tooLarge.body().contains("文件长度不合法"), tooLarge.body());
+
+        LocalServerApiTest.Raw.Res nullMeta = restoreWithRawMeta(
+                "null".getBytes(StandardCharsets.UTF_8), product, mapping, token);
+        assertEquals(400, nullMeta.status(), nullMeta.body());
+        assertTrue(nullMeta.body().contains("JSON 对象"), nullMeta.body());
+        assertSessionEmpty();
+    }
+
+    @Test
+    @DisplayName("导入映射的令牌和原值必须在有界 schema 内")
+    void 映射条目严格校验() throws Exception {
+        byte[] emptyToken = rewriteMapping(map -> {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> values = (Map<String, Object>) map.get("mapping");
+            values.clear();
+            values.put("", "x");
+        });
+        LocalServerApiTest.Raw.Res response = restore(product, emptyToken, PASSPHRASE, 1, token,
+                "a.txt", "empty-token.map.json");
+        assertEquals(400, response.status(), response.body());
+        assertTrue(response.body().contains("映射令牌"), response.body());
+        assertSessionEmpty();
     }
 
     @Test
     @DisplayName("单任务入场：第二份不读请求体就拒绝，健康检查与取消仍可响应")
     void 单任务入场与取消() throws Exception {
-        try (Socket slow = openIncompleteRestore(port, token, 1024, 1)) {
-            LocalServerApiTest.Raw.Res canceled = waitUntilCancelable(port, token);
-            assertEquals(200, canceled.status(), canceled.body());
-            assertTrue(canceled.body().contains("\"canceled\":true"), canceled.body());
-            assertFalse(canceled.headers().containsKey("content-disposition"),
-                    "取消回应只能是 JSON，不能伪装成还原件");
-
+        Socket slow = openIncompleteRestore(port, token, 1024, 1);
+        try {
+            waitForSessionNonEmpty(workspace);
             // 只发第二份的 HTTP 头，不发它声明的 1MB 请求体。
             // 若服务在入场拒绝前读 body，这里会阻塞直到 socket 超时；
             // 能立即读到 409 就证明没分配/读取第二份文件。
@@ -252,31 +349,47 @@ class RestoreImportTest {
 
             LocalServerApiTest.Raw.Res health = LocalServerApiTest.Raw.get(port, "/api/health");
             assertEquals(200, health.status(), health.body());
-            // slow 还未关，工作线程还在 finally 之前；取消不得提前释放入场。
-            LocalServerApiTest.Raw.Res stillBusy = restore(product, mapping, PASSPHRASE, 1, token,
+
+            LocalServerApiTest.Raw.Res canceled = waitUntilCancelable(port, token);
+            assertEquals(200, canceled.status(), canceled.body());
+            assertTrue(canceled.body().contains("\"canceled\":true"), canceled.body());
+            assertFalse(canceled.headers().containsKey("content-disposition"),
+                    "取消回应只能是 JSON，不能伪装成还原件");
+
+            // 客户端故意保持未完整上传的 socket 开启；服务端必须自己打断 read、
+            // 走完 finally 并释放入场，不能借助客户端 close。
+            waitForSessionCleanup(workspace);
+            LocalServerApiTest.Raw.Res next = restore(product, mapping, PASSPHRASE, 1, token,
                     "a.txt", "a.map.json");
-            assertEquals(409, stillBusy.status(), stillBusy.body());
+            assertEquals(200, next.status(), next.body());
+        } finally {
+            slow.close();
         }
-        waitForSessionCleanup(workspace);
     }
 
     @Test
-    @DisplayName("还原沿用可配时限：超时只返 JSON，不交付附件")
+    @DisplayName("还原沿用可配时限：慢上传保持开启也会被断开并清理")
     void 超时不交付文件(@TempDir Path tmp) throws Exception {
         try (Workspace timedWorkspace = Workspace.open(tmp.resolve("timeout"))) {
             LocalServer timedServer = LocalServer.create(timedWorkspace, 0);
-            ApiHandlers.register(timedServer, timedWorkspace, ApiHandlers.defaultRules(), List.of(), 1);
+            ApiHandlers.register(timedServer, timedWorkspace, ApiHandlers.defaultRules(), List.of(), 250);
             timedServer.start();
+            Socket slow = openIncompleteRestore(timedServer.port(), timedServer.policy().token(), 1024, 1);
             try {
-                LocalServerApiTest.Raw.Res response = restoreAt(timedServer.port(),
-                        timedServer.policy().token(), product, mapping, PASSPHRASE, 1,
-                        "a.txt", "a.map.json");
-                assertEquals(408, response.status(), response.body());
-                assertTrue(response.body().contains("取消或超过"), response.body());
-                assertFalse(response.headers().containsKey("content-disposition"),
-                        "超时后不得交付部分还原件");
+                waitForSessionNonEmpty(timedWorkspace);
                 waitForSessionCleanup(timedWorkspace);
+
+                slow.setSoTimeout(2_000);
+                try {
+                    assertEquals(-1, slow.getInputStream().read(),
+                            "超时应在任何附件响应头之前直接断开连接");
+                } catch (SocketTimeoutException e) {
+                    throw new AssertionError("服务端没有主动打断阻塞上传", e);
+                }
+                assertFalse(waitUntilCancelableFalse(timedServer.port(), timedServer.policy().token()),
+                        "超时清理后不应还有活动任务");
             } finally {
+                slow.close();
                 timedServer.close();
             }
         }
@@ -290,15 +403,19 @@ class RestoreImportTest {
             ApiHandlers.register(closingServer, closingWorkspace, ApiHandlers.defaultRules());
             closingServer.start();
             Socket slow = openIncompleteRestore(closingServer.port(), closingServer.policy().token(), 1024, 1);
-            waitUntilCancelable(closingServer.port(), closingServer.policy().token());
-            Thread closer = new Thread(closingServer::close, "restore-close-test");
-            closer.start();
-            slow.close();
-            closer.join(5_000);
-            assertFalse(closer.isAlive(), "关闭应等工作线程走完 finally 而后返回");
-            waitForSessionCleanup(closingWorkspace);
-            Thread.sleep(100);
-            assertSessionEmpty(closingWorkspace);
+            try {
+                waitForSessionNonEmpty(closingWorkspace);
+                Thread closer = new Thread(closingServer::close, "restore-close-test");
+                closer.start();
+                closer.join(5_000);
+                assertFalse(closer.isAlive(), "客户端不 close 时，服务关闭也应打断上传并等 finally 完成");
+                waitForSessionCleanup(closingWorkspace);
+                Thread.sleep(100);
+                assertSessionEmpty(closingWorkspace);
+            } finally {
+                slow.close();
+                closingServer.close();
+            }
         }
     }
 
@@ -315,6 +432,16 @@ class RestoreImportTest {
                                                          String passphrase, int version,
                                                          String productName, String mappingName)
             throws IOException {
+        byte[] request = restoreRequest(productBytes, mappingBytes, passphrase, version,
+                productName, mappingName);
+        return LocalServerApiTest.Raw.req(targetPort, "POST", "/api/restore-import",
+                "127.0.0.1:" + targetPort, null, auth, request,
+                Map.of("Content-Type", "application/octet-stream"));
+    }
+
+    private static byte[] restoreRequest(byte[] productBytes, byte[] mappingBytes,
+                                         String passphrase, int version,
+                                         String productName, String mappingName) throws IOException {
         byte[] meta = Json.toBytes(Map.of(
                 "productName", productName,
                 "mappingName", mappingName,
@@ -324,8 +451,20 @@ class RestoreImportTest {
         request.putInt(0x4c4d5231).putInt(version).putInt(meta.length)
                 .putLong(productBytes.length).putLong(mappingBytes.length)
                 .put(meta).put(productBytes).put(mappingBytes);
-        return LocalServerApiTest.Raw.req(targetPort, "POST", "/api/restore-import",
-                "127.0.0.1:" + targetPort, null, auth, request.array(),
+        return request.array();
+    }
+
+    private static LocalServerApiTest.Raw.Res restoreWithRawMeta(byte[] meta,
+                                                                 byte[] productBytes,
+                                                                 byte[] mappingBytes,
+                                                                 String auth) throws IOException {
+        ByteBuffer request = ByteBuffer.allocate(28 + meta.length + productBytes.length + mappingBytes.length)
+                .order(ByteOrder.BIG_ENDIAN);
+        request.putInt(0x4c4d5231).putInt(1).putInt(meta.length)
+                .putLong(productBytes.length).putLong(mappingBytes.length)
+                .put(meta).put(productBytes).put(mappingBytes);
+        return LocalServerApiTest.Raw.req(port, "POST", "/api/restore-import",
+                "127.0.0.1:" + port, null, auth, request.array(),
                 Map.of("Content-Type", "application/octet-stream"));
     }
 
@@ -367,6 +506,14 @@ class RestoreImportTest {
                 + (last == null ? "无响应" : last.body()));
     }
 
+    private static boolean waitUntilCancelableFalse(int targetPort, String auth) throws Exception {
+        LocalServerApiTest.Raw.Res response = LocalServerApiTest.Raw.req(targetPort, "POST",
+                "/api/restore-import-cancel", "127.0.0.1:" + targetPort,
+                null, auth, new byte[0]);
+        assertEquals(200, response.status(), response.body());
+        return response.body().contains("\"canceled\":true");
+    }
+
     @SuppressWarnings("unchecked")
     private static byte[] rewriteMapping(Consumer<Map<String, Object>> edit) throws Exception {
         byte[] opened = SecretMap.open(mapping, PASSPHRASE.toCharArray());
@@ -393,5 +540,27 @@ class RestoreImportTest {
             Thread.sleep(20);
         }
         assertSessionEmpty(target);
+    }
+
+    private static void waitForSessionNonEmpty(Workspace target) throws Exception {
+        for (int i = 0; i < 100; i++) {
+            try (var files = Files.list(target.sessionDir())) {
+                if (files.findAny().isPresent()) return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("还原上传未进入服务端临时会话目录");
+    }
+
+    private static Map<String, byte[]> unzip(byte[] zip) throws IOException {
+        Map<String, byte[]> entries = new LinkedHashMap<>();
+        try (ZipInputStream input = new ZipInputStream(new ByteArrayInputStream(zip))) {
+            for (var entry = input.getNextEntry(); entry != null; entry = input.getNextEntry()) {
+                if (!entry.isDirectory()) {
+                    entries.put(entry.getName(), input.readAllBytes());
+                }
+            }
+        }
+        return entries;
     }
 }

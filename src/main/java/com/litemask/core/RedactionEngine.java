@@ -497,7 +497,12 @@ public final class RedactionEngine {
         StringBuilder sb = new StringBuilder(text.length());
         int count = 0;
         while (matcher.find()) {
-            matcher.appendReplacement(sb, Matcher.quoteReplacement(mapping.get(matcher.group())));
+            TaskContext.current().checkCancelled();
+            String matched = matcher.group();
+            String replacement = mapping.get(matched);
+            TaskContext.current().reserveRestoreGrowth(
+                    Math.max(0L, (long) replacement.length() - matched.length()));
+            matcher.appendReplacement(sb, Matcher.quoteReplacement(replacement));
             count++;
         }
         matcher.appendTail(sb);

@@ -409,8 +409,17 @@ public final class DocumentService {
      */
     public static RestoreResult restore(Path in, Path out, Format format,
                                         Map<String, String> mapping) throws IOException {
+        com.litemask.core.TaskContext.current().checkCancelled();
         Map<String, String> m = mapping == null ? Map.of() : mapping;
         List<String> warnings = new ArrayList<>();
+        if (m.isEmpty()) {
+            java.nio.file.Files.copy(in, out,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            warnings.add("映射为空：这份脱敏件没有可还原的令牌，已原样生成还原件。");
+            warnings.add("还原的是**文本内容**：文档属性清空、签章移除、数值单元格转文本这些动作不可逆，"
+                    + "还原件与原件在文本上一致，但不是同一个文件。");
+            return new RestoreResult(0, List.copyOf(warnings));
+        }
         int count = switch (format) {
             case DOCX -> DocxRedactor.restore(in, out, m);
             case XLSX -> XlsxRedactor.restore(in, out, m);
@@ -434,6 +443,7 @@ public final class DocumentService {
                 yield restored.count();
             }
         };
+        com.litemask.core.TaskContext.current().checkCancelled();
         warnings.add("还原的是**文本内容**：文档属性清空、签章移除、数值单元格转文本这些动作不可逆，"
                 + "还原件与原件在文本上一致，但不是同一个文件。");
         return new RestoreResult(count, List.copyOf(warnings));

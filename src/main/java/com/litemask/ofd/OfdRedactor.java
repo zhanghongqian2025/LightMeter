@@ -9,6 +9,7 @@ import com.litemask.core.RedactionResult;
 import com.litemask.core.RedactionSession;
 import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
+import com.litemask.core.TaskContext;
 import com.litemask.core.SlotTextMapper;
 import com.litemask.zipxml.ZipXmlPackage;
 import org.w3c.dom.Document;
@@ -318,6 +319,7 @@ public final class OfdRedactor {
             int restored = 0;
 
             for (ZipEntry entry : entries) {
+                TaskContext.current().checkCancelled();
                 String name = entry.getName();
                 if (!entry.isDirectory()) {
                     // 条目名本身也可能含令牌：附件文件名脱敏时会被改名，这里改回去
@@ -347,6 +349,7 @@ public final class OfdRedactor {
         int restored = 0;
         NodeList all = doc.getElementsByTagName("*");
         for (int i = 0; i < all.getLength(); i++) {
+            TaskContext.current().checkCancelled();
             Element element = (Element) all.item(i);
             if (!hasElementChild(element)) {
                 String before = element.getTextContent();

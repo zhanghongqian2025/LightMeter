@@ -7,6 +7,7 @@ import com.litemask.core.HitGrouping;
 import com.litemask.core.RedactionSession;
 import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
+import com.litemask.core.TaskContext;
 import com.litemask.core.SlotTextMapper;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.cos.COSName;
@@ -280,10 +281,12 @@ public final class PdfRedactor {
         List<Hit> hits = new ArrayList<>();
 
         for (Unit unit : units) {
+            TaskContext.current().checkCancelled();
             // 只在同一行内拼接：跨行硬拼会造出原文里不存在的字符串，把真敏感信息顶掉
             Map<Integer, List<PdfStreamRewriter.OpEdit>> allEdits = new LinkedHashMap<>();
             int blockIndex = 0;
             for (TextBlock block : splitBlocks(unit)) {
+                TaskContext.current().checkCancelled();
                 // findEdits 只能调一次：它会驱动引擎分配令牌（副作用），
                 // 调两次就会凭空多出一批令牌与改动。
                 List<Change> blockChanges = findEdits.find(block.slots(), block.joined());
@@ -461,7 +464,12 @@ public final class PdfRedactor {
         List<Change> out = new ArrayList<>();
         Matcher m = pattern.matcher(text);
         while (m.find()) {
-            out.add(new Change(mapping.get(m.group()), m.group(), m.start(), m.end(), "restore"));
+            TaskContext.current().checkCancelled();
+            String token = m.group();
+            String original = mapping.get(token);
+            TaskContext.current().reserveRestoreGrowth(
+                    Math.max(0L, (long) original.length() - token.length()));
+            out.add(new Change(original, token, m.start(), m.end(), "restore"));
         }
         return out;
     }
@@ -471,7 +479,12 @@ public final class PdfRedactor {
         StringBuilder sb = new StringBuilder(text.length());
         int last = 0;
         while (m.find()) {
-            sb.append(text, last, m.start()).append(mapping.get(m.group()));
+            TaskContext.current().checkCancelled();
+            String token = m.group();
+            String original = mapping.get(token);
+            TaskContext.current().reserveRestoreGrowth(
+                    Math.max(0L, (long) original.length() - token.length()));
+            sb.append(text, last, m.start()).append(original);
             last = m.end();
         }
         return sb.append(text.substring(last)).toString();

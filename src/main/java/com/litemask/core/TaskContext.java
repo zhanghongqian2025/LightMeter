@@ -35,6 +35,9 @@ public final class TaskContext {
     private volatile boolean cancelled;
     private boolean committed;
     private final ProgressListener listener;
+    /** 还原相对输入允许新增的字符数；Long.MAX_VALUE 表示旧调用无限制。 */
+    private final long maxRestoreGrowthChars;
+    private long restoreGrowthChars;
 
     /**
      * 进度回调。
@@ -50,13 +53,28 @@ public final class TaskContext {
     }
 
     private TaskContext(ProgressListener listener, boolean cancelable) {
+        this(listener, cancelable, Long.MAX_VALUE);
+    }
+
+    private TaskContext(ProgressListener listener, boolean cancelable, long maxRestoreGrowthChars) {
         this.listener = listener;
         this.cancelable = cancelable;
+        if (maxRestoreGrowthChars < 0) {
+            throw new IllegalArgumentException("还原增长预算不能为负数");
+        }
+        this.maxRestoreGrowthChars = maxRestoreGrowthChars;
     }
 
     /** 造一个可取消、可报进度的上下文。 */
     public static TaskContext create(ProgressListener listener) {
         return new TaskContext(listener, true);
+    }
+
+    /**
+     * 造一个带「实际还原文本增长」预算的上下文。预算在同一份文档的多段/多单元间累计。
+     */
+    public static TaskContext create(ProgressListener listener, long maxRestoreGrowthChars) {
+        return new TaskContext(listener, true, maxRestoreGrowthChars);
     }
 
     /** 请求取消。已在运行的那一段会跑到下一个检查点才停。 */
@@ -113,6 +131,21 @@ public final class TaskContext {
     }
 
     /**
+     * 在把映射原值追加进 StringBuilder <b>之前</b>登记实际正增长。
+     * 默认上下文无限制，只有处理不可信导入映射时设定预算。
+     */
+    public synchronized void reserveRestoreGrowth(long chars) {
+        checkCancelled();
+        if (chars <= 0 || maxRestoreGrowthChars == Long.MAX_VALUE) {
+            return;
+        }
+        if (chars > maxRestoreGrowthChars - restoreGrowthChars) {
+            throw new RestoreBudgetExceededException(maxRestoreGrowthChars);
+        }
+        restoreGrowthChars += chars;
+    }
+
+    /**
      * 报一个进度点。<b>不抛</b>——取消的判定权在调用方手里，
      * 这里只负责把「到哪了」说出来。
      */
@@ -163,6 +196,13 @@ public final class TaskContext {
     public static final class CanceledException extends RuntimeException {
         public CanceledException() {
             super("任务已取消");
+        }
+    }
+
+    /** 导入映射会让还原文本过度膨胀。 */
+    public static final class RestoreBudgetExceededException extends RuntimeException {
+        public RestoreBudgetExceededException(long limit) {
+            super("映射还原后的文本增长超过安全上限（" + limit + " 个字符）");
         }
     }
 }

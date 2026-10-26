@@ -9,6 +9,7 @@ import com.litemask.core.RedactionResult;
 import com.litemask.core.RedactionSession;
 import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
+import com.litemask.core.TaskContext;
 import com.litemask.core.SlotTextMapper;
 import com.litemask.core.TextPlan;
 import com.litemask.ooxml.DocPropsScrubber;
@@ -118,6 +119,7 @@ public final class PptxRedactor {
             Map<String, byte[]> changed = new LinkedHashMap<>();
             int restored = 0;
             for (ZipEntry entry : pkg.entries()) {
+                TaskContext.current().checkCancelled();
                 if (!isProcessablePart(entry.getName())) {
                     continue;
                 }
@@ -127,6 +129,7 @@ public final class PptxRedactor {
                     for (String local : new String[]{"t", "v"}) {
                         NodeList nodes = doc.getElementsByTagNameNS(ns, local);
                         for (int i = 0; i < nodes.getLength(); i++) {
+                            TaskContext.current().checkCancelled();
                             Element node = (Element) nodes.item(i);
                             String back = RedactionEngine.restore(node.getTextContent(), mapping);
                             if (!back.equals(node.getTextContent())) {

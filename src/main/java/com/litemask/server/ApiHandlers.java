@@ -24,15 +24,19 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 /**
  * HTTP 接口。
@@ -431,7 +435,7 @@ public final class ApiHandlers {
     private static void restoreImport(HttpExchange ex, Workspace workspace,
                                       RestoreImportGate gate) throws IOException {
         try {
-            gate.execute(ctx -> restoreImportWork(ex, workspace, ctx));
+            gate.execute(ex, ctx -> restoreImportWork(ex, workspace, ctx));
         } catch (RestoreBusyException e) {
             Http.json(ex, 409, Map.of("ok", false, "error", e.getMessage()));
         }
@@ -496,11 +500,15 @@ public final class ApiHandlers {
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
             Http.json(ex, 400, Map.of("ok", false,
                     "error", "映射文件的内容不是可识别的 JSON"));
+        } catch (com.litemask.core.TaskContext.RestoreBudgetExceededException e) {
+            Http.json(ex, 400, Map.of("ok", false, "error", e.getMessage()));
         } catch (com.litemask.core.TaskContext.CanceledException e) {
-            Http.json(ex, 408, Map.of("ok", false,
-                    "error", "还原已取消或超过处理时限，未生成还原文件"));
+            // 取消方已在尚未发送响应头时直接关闭 exchange，
+            // 这里不能再发 408：JDK HttpServer 会尝试排空上传体，反而可能再次阻塞。
         } catch (IOException e) {
-            Http.json(ex, 400, Map.of("ok", false, "error", "还原失败：" + e.getMessage()));
+            if (!context.isCancelled()) {
+                Http.json(ex, 400, Map.of("ok", false, "error", "还原失败：" + e.getMessage()));
+            }
         } finally {
             com.litemask.core.SecretMap.wipe(passphrase);
             if (opened != null) {
@@ -521,6 +529,16 @@ public final class ApiHandlers {
 
     private static final long MAX_MAPPING_BYTES = 16L * 1024 * 1024;
     private static final int MAX_PASSPHRASE_CHARS = 512;
+    private static final int MAX_MAPPING_ENTRIES = 10_000;
+    private static final int MAX_MAPPING_TOKEN_CHARS = 128;
+    private static final int MAX_MAPPING_VALUE_CHARS = 1 * 1024 * 1024;
+    private static final long MAX_RESTORE_GROWTH_CHARS = 64L * 1024 * 1024;
+    // TokenAllocator 产生角括号形态；OFD 附件名为了兼容 Windows 文件名，
+    // 会把同一令牌转成全角方括号形态并一起写入映射。导入只接受这两个生产者形态。
+    private static final Pattern IMPORT_ANGLE_TOKEN =
+            Pattern.compile("<([^<>\\r\\n]+?)(\\d+)>");
+    private static final Pattern IMPORT_OFD_FILENAME_TOKEN =
+            Pattern.compile("［([^［］\\r\\n]+?)(\\d+)］");
     private static final int MAX_RESTORE_META_BYTES = 8 * 1024;
     private static final int RESTORE_MAGIC = 0x4c4d5231; // "LMR1"
     private static final int RESTORE_ENVELOPE_VERSION = 1;
@@ -579,6 +597,9 @@ public final class ApiHandlers {
                     RestoreEnvelopeMeta.class);
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
             throw new JobStore.BadRequestException("还原请求的元数据不是合法 JSON");
+        }
+        if (meta == null) {
+            throw new JobStore.BadRequestException("还原请求的元数据必须是 JSON 对象");
         }
         requireSafeUploadName(meta.productName(), "脱敏文件");
         requireSafeUploadName(meta.mappingName(), "映射文件");
@@ -672,14 +693,33 @@ public final class ApiHandlers {
         if (!(node instanceof Map<?, ?> raw)) {
             throw new JobStore.BadRequestException("映射文件里没有可用的 mapping 段");
         }
+        if (raw.size() > MAX_MAPPING_ENTRIES) {
+            throw new JobStore.BadRequestException("映射条目超过 " + MAX_MAPPING_ENTRIES + " 条上限");
+        }
         Map<String, String> mapping = new LinkedHashMap<>();
         for (Map.Entry<?, ?> entry : raw.entrySet()) {
             if (!(entry.getKey() instanceof String key) || !(entry.getValue() instanceof String value)) {
                 throw new JobStore.BadRequestException("映射文件的 mapping 段格式不对");
             }
+            if (key.isEmpty() || key.length() > MAX_MAPPING_TOKEN_CHARS
+                    || !isImportedToken(key)) {
+                throw new JobStore.BadRequestException(
+                        "映射令牌必须是工具生成的 <前缀N> 或 OFD 附件名［前缀N］形式，且不超过 "
+                                + MAX_MAPPING_TOKEN_CHARS + " 个字符");
+            }
+            if (value.isEmpty() || value.length() > MAX_MAPPING_VALUE_CHARS) {
+                throw new JobStore.BadRequestException(
+                        "映射原值必须非空，且单条不超过 "
+                                + MAX_MAPPING_VALUE_CHARS + " 个字符");
+            }
             mapping.put(key, value);
         }
         return Map.copyOf(mapping);
+    }
+
+    private static boolean isImportedToken(String token) {
+        return IMPORT_ANGLE_TOKEN.matcher(token).matches()
+                || IMPORT_OFD_FILENAME_TOKEN.matcher(token).matches();
     }
 
     private static void verifyImportedFormat(Map<String, Object> mapFile, DocumentService.Format actual)
@@ -764,7 +804,7 @@ public final class ApiHandlers {
             t.setDaemon(true);
             return t;
         });
-        private final AtomicReference<com.litemask.core.TaskContext> active = new AtomicReference<>();
+        private final AtomicReference<ActiveRestore> active = new AtomicReference<>();
         private final long timeoutMs;
         private volatile boolean closed;
 
@@ -772,24 +812,42 @@ public final class ApiHandlers {
             this.timeoutMs = timeoutMs;
         }
 
-        void execute(RestoreBody body) throws IOException, RestoreBusyException {
+        void execute(HttpExchange exchange, RestoreBody body) throws IOException, RestoreBusyException {
             if (closed || !admission.tryAcquire()) {
                 throw new RestoreBusyException(closed
                         ? "还原服务正在关闭"
                         : "已有一份文件正在还原，请等它完成或取消后再试");
             }
-            com.litemask.core.TaskContext context = com.litemask.core.TaskContext.create(null);
-            active.set(context);
-            ScheduledFuture<?> timeout = timeoutMs > 0
-                    ? timer.schedule(context::requestCancel, timeoutMs, TimeUnit.MILLISECONDS)
-                    : null;
+            com.litemask.core.TaskContext context = com.litemask.core.TaskContext.create(
+                    null, MAX_RESTORE_GROWTH_CHARS);
+            ActiveRestore run = new ActiveRestore(context, exchange);
+            active.set(run);
+            ScheduledFuture<?> timeout = null;
             Future<Void> future;
             try {
-                future = worker.submit(() -> com.litemask.core.TaskContext.in(
-                        context, () -> body.run(context)));
+                if (closed) {
+                    throw new RejectedExecutionException("还原服务正在关闭");
+                }
+                timeout = timeoutMs > 0
+                        ? timer.schedule(run::cancel, timeoutMs, TimeUnit.MILLISECONDS)
+                        : null;
+                future = worker.submit(() -> {
+                    if (!run.bindWorker()) {
+                        return null;
+                    }
+                    try {
+                        return com.litemask.core.TaskContext.in(context, () -> body.run(context));
+                    } finally {
+                        run.workerTerminated();
+                    }
+                });
+                run.attachFuture(future);
             } catch (RuntimeException e) {
                 if (timeout != null) timeout.cancel(false);
-                active.compareAndSet(context, null);
+                run.cancel();
+                run.rejectedBeforeStart();
+                run.awaitTerminationUninterruptibly();
+                active.compareAndSet(run, null);
                 admission.release();
                 throw new IOException("还原服务无法接收任务", e);
             }
@@ -801,7 +859,7 @@ public final class ApiHandlers {
                         break;
                     } catch (InterruptedException e) {
                         interrupted = true;
-                        context.requestCancel();
+                        run.cancel();
                         // HTTP 处理线程被关闭中断时，仍等自有工作线程走到 finally：
                         // 提前释放入场或删文件会与它继续写相互竞争。
                     } catch (ExecutionException e) {
@@ -809,19 +867,23 @@ public final class ApiHandlers {
                         if (cause instanceof IOException io) throw io;
                         if (cause instanceof RuntimeException runtime) throw runtime;
                         throw new IOException("还原任务失败", cause);
+                    } catch (CancellationException e) {
+                        // 排队期取消：ActiveRestore 的 terminated 才是真正的收尾信号。
+                        break;
                     }
                 }
             } finally {
                 if (timeout != null) timeout.cancel(false);
-                active.compareAndSet(context, null);
+                run.awaitTerminationUninterruptibly();
+                active.compareAndSet(run, null);
                 admission.release();
                 if (interrupted) Thread.currentThread().interrupt();
             }
         }
 
         boolean cancelActive() {
-            com.litemask.core.TaskContext context = active.get();
-            return context != null && context.requestCancel();
+            ActiveRestore run = active.get();
+            return run != null && run.cancel();
         }
 
         @Override
@@ -840,6 +902,106 @@ public final class ApiHandlers {
                 }
             }
             if (interrupted) Thread.currentThread().interrupt();
+        }
+
+        private static final class ActiveRestore {
+            private final com.litemask.core.TaskContext context;
+            private final HttpExchange exchange;
+            private final CountDownLatch terminated = new CountDownLatch(1);
+            private Future<?> future;
+            private Thread workerThread;
+            private boolean started;
+            private boolean finished;
+
+            ActiveRestore(com.litemask.core.TaskContext context, HttpExchange exchange) {
+                this.context = context;
+                this.exchange = exchange;
+            }
+
+            synchronized boolean bindWorker() {
+                if (finished) {
+                    return false;
+                }
+                Thread current = Thread.currentThread();
+                started = true;
+                workerThread = current;
+                if (context.isCancelled()) {
+                    current.interrupt();
+                }
+                return true;
+            }
+
+            void attachFuture(Future<?> submitted) {
+                boolean cancelQueued;
+                synchronized (this) {
+                    future = submitted;
+                    cancelQueued = context.isCancelled() && !started && !finished;
+                }
+                if (cancelQueued && submitted.cancel(false)) {
+                    terminateBeforeStart();
+                }
+            }
+
+            boolean cancel() {
+                if (!context.requestCancel()) {
+                    return false;
+                }
+                Future<?> queued;
+                synchronized (this) {
+                    // 与 workerTerminated 共用身份锁：旧取消不能在任务收尾后
+                    // 再中断已被线程池复用的线程。
+                    if (workerThread != null) {
+                        workerThread.interrupt();
+                    }
+                    queued = !started && !finished ? future : null;
+                }
+                // 错误响应也可能已打开输出包装。先中断正在排空输入的 worker，
+                // 再关闭 exchange，避免 close 自己等在未完成上传上。
+                exchange.close();
+                if (queued != null && queued.cancel(false)) {
+                    terminateBeforeStart();
+                }
+                return true;
+            }
+
+            void workerTerminated() {
+                // SocketChannel 的中断会在池线程上留下 interrupt 标记；
+                // 清掉它再返回单线程执行器，避免下一份还原被旧取消误伤。
+                synchronized (this) {
+                    workerThread = null;
+                    finished = true;
+                    Thread.interrupted();
+                }
+                terminated.countDown();
+            }
+
+            void rejectedBeforeStart() {
+                terminateBeforeStart();
+            }
+
+            private void terminateBeforeStart() {
+                synchronized (this) {
+                    if (started || finished) {
+                        return;
+                    }
+                    finished = true;
+                }
+                terminated.countDown();
+            }
+
+            void awaitTerminationUninterruptibly() {
+                boolean interrupted = false;
+                while (true) {
+                    try {
+                        terminated.await();
+                        break;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                        cancel();
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt();
+            }
         }
     }
 

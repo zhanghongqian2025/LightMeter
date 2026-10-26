@@ -270,6 +270,11 @@
       这里只支持<b>新版、带脱敏成品校验信息</b>的加密映射文件；
       旧版未绑定映射无法在重启后安全确认配对，会被拒绝。
     </p>
+    <p class="muted small">
+      独立还原上限：映射文件 16 MiB、10,000 条映射、单条原值 1,048,576 个字符，
+      累计文本增长 67,108,864 个字符。超限时不会生成还原文件；
+      大型映射请先在原任务完成页保存还原件，再退出程序。
+    </p>
     <div class="restore-files">
       <label>脱敏文件
         <input type="file" id="restoreProductFile" accept=".docx,.xlsx,.pptx,.pdf,.ofd,.txt">

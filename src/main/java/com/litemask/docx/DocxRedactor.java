@@ -12,6 +12,7 @@ import com.litemask.ooxml.DocPropsScrubber;
 import com.litemask.zipxml.ZipXmlPackage;
 import com.litemask.core.Exclusions;
 import com.litemask.core.Rule;
+import com.litemask.core.TaskContext;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -154,6 +155,7 @@ public final class DocxRedactor {
             Map<String, byte[]> changed = new LinkedHashMap<>();
             int restored = 0;
             for (ZipEntry entry : pkg.entries()) {
+                TaskContext.current().checkCancelled();
                 if (!isProcessablePart(entry.getName())) {
                     continue;
                 }
@@ -162,6 +164,7 @@ public final class DocxRedactor {
                 boolean dirty = false;
                 NodeList list = doc.getElementsByTagNameNS(W_NS, "p");
                 for (int i = 0; i < list.getLength(); i++) {
+                    TaskContext.current().checkCancelled();
                     for (Element slot : collectSlots((Element) list.item(i))) {
                         String text = slot.getTextContent();
                         String back = RedactionEngine.restore(text, mapping);

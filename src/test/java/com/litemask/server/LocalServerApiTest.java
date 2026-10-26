@@ -353,6 +353,17 @@ class LocalServerApiTest {
             return exchange(port, method, path, host, origin, tokenHeader, extraHeaders, new byte[0]).body();
         }
 
+        /** 带二进制请求体，并保留二进制响应体。 */
+        static byte[] bodyBytes(int port, String method, String path, String host,
+                                String origin, String tokenHeader, byte[] body,
+                                Map<String, String> extraHeaders) throws IOException {
+            ResBytes response = exchange(port, method, path, host, origin, tokenHeader,
+                    extraHeaders, body);
+            assertEquals(200, response.status(),
+                    () -> new String(response.body(), StandardCharsets.UTF_8));
+            return response.body();
+        }
+
         private record ResBytes(int status, Map<String, List<String>> headers, byte[] body) {
         }
 
