@@ -247,8 +247,9 @@
       就会把它当成「随手传给别人也没事」的东西——而它装着全部原值。
     -->
     <p class="keep-note" id="sealedNote" hidden>
-      映射文件已用口令加密（<b>文件里没有原文</b>）。还原时需要同一个口令：
-      命令行 <code>restore --map &lt;映射文件&gt; --map-pass-env &lt;变量&gt;</code>。
+      映射文件已用口令加密（<b>文件里没有原文</b>）。
+      重启程序后，在「还原已保存的脱敏文件」中选择这份脱敏文件、加密映射文件，
+      并输入同一个口令即可还原。
     </p>
     <p class="muted small" id="restoreHint">
       还原的是<b>文本内容</b>：文档属性清空、签章移除、数值单元格转文本这些动作不可逆，
@@ -294,6 +295,20 @@
       <span class="muted small" id="restoreImportStatus">选择两个文件并输入口令后才会开始。</span>
     </div>
     <div class="error" id="restoreImportError" hidden></div>
+  </section>
+
+  <section class="card shutdown-card" id="shutdownCard" hidden>
+    <h2>退出本机服务</h2>
+    <p class="keep-note">
+      退出前请先确认<b>脱敏文件和映射文件都已保存</b>。
+      退出会停止本机服务并清理本次会话的临时文件；
+      正在处理的文档会被请求取消，某些格式可能要到下一个安全检查点才停下。
+    </p>
+    <div class="bar">
+      <button id="shutdownBtn" class="danger">退出本机服务</button>
+      <span class="muted small" id="shutdownStatus">关闭浏览器页面不会自动退出服务。</span>
+    </div>
+    <div class="error" id="shutdownError" hidden></div>
   </section>
 
   <section class="card">

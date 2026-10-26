@@ -15,6 +15,8 @@ import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -60,6 +62,9 @@ public final class LocalServer implements AutoCloseable {
      * 而它们跑的是「脱敏用户文档」，没人愿意为一个已经退出的程序多等几秒。
      */
     private final List<AutoCloseable> resources = new ArrayList<>();
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean shutdownRequested = new AtomicBoolean();
+    private volatile Runnable shutdownRequest;
 
     private LocalServer(HttpServer http, Workspace workspace, SecurityPolicy policy, ExecutorService executor) {
         this.http = http;
@@ -249,8 +254,45 @@ public final class LocalServer implements AutoCloseable {
         }
     }
 
+    /**
+     * 注入「请求整个桌面服务退出」的生命周期回调。
+     *
+     * <p>没有注入时就不应暴露 GUI 退出路由：测试内嵌服务、库调用者和
+     * 命令行同步服务的生命周期都由它们自己管，网页不能擅自关掉。
+     */
+    public void onShutdownRequest(Runnable request) {
+        if (request == null) {
+            throw new IllegalArgumentException("停服回调不能为 null");
+        }
+        if (shutdownRequest != null) {
+            throw new IllegalStateException("停服回调已注册");
+        }
+        shutdownRequest = request;
+    }
+
+    public boolean shutdownRequestEnabled() {
+        return shutdownRequest != null;
+    }
+
+    /**
+     * 响应已完整写出后，在独立守护线程上发出一次性停服信号。
+     * 回调不在 HTTP 请求线程上执行，因此不会发生「正在写退出响应时把自己关掉」。
+     */
+    public void requestShutdownAfterResponse() {
+        Runnable request = shutdownRequest;
+        if (request == null || !shutdownRequested.compareAndSet(false, true)) {
+            return;
+        }
+        Thread signal = new Thread(request, "litemask-shutdown-request");
+        signal.setDaemon(true);
+        signal.start();
+    }
+
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         http.stop(0);
         executor.shutdownNow();
         for (int i = resources.size() - 1; i >= 0; i--) {
@@ -259,6 +301,18 @@ public final class LocalServer implements AutoCloseable {
             } catch (Exception ignored) {
                 // 关闭失败不该把服务关不掉——它已经在停了
             }
+        }
+        boolean interrupted = false;
+        while (!executor.isTerminated()) {
+            try {
+                executor.awaitTermination(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                interrupted = true;
+                executor.shutdownNow();
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

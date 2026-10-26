@@ -262,6 +262,27 @@ class TaskCancelTest {
         }
     }
 
+    @Test
+    @DisplayName("关闭 TaskRunner 会请求取消并等实际工作线程退出")
+    void closeCancelsAndWaitsForWorkers() throws Exception {
+        TaskRunner runner = new TaskRunner(jobs);
+        TaskRunner.Task task = 提交(runner, "closing.docx", docx(1500));
+        等到开跑(runner, task);
+
+        Thread closer = new Thread(runner::close, "task-runner-close-test");
+        closer.start();
+        closer.join(20_000);
+
+        assertFalse(closer.isAlive(), "close 应在工作线程走完取消收尾后返回");
+        assertTrue(task.cancelRequested, "close 必须向正在跑的 TaskContext 请求协作取消");
+        assertEquals(TaskRunner.Status.CANCELED, task.status(),
+                "close 返回时任务应已是真正终态，不是只改标志");
+
+        IOException rejected = assertThrows(IOException.class,
+                () -> 提交(runner, "after-close.txt", "x".getBytes(StandardCharsets.UTF_8)));
+        assertTrue(rejected.getMessage().contains("正在停止"), rejected.getMessage());
+    }
+
     /**
      * 取消一个<b>已经跑完</b>的任务是空操作。
      *

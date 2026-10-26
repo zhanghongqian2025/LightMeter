@@ -719,6 +719,30 @@ class WebUiTest {
         assertTrue(js.contains("addEventListener(\"click\""),
                 "选文件时不得自动上传，只有点按钮才发请求");
         assertTrue(js.contains("restorePass\").value = \"\""), "口令用完应从输入框清掉");
+        assertTrue(html.contains("重启程序后") && html.contains("还原已保存的脱敏文件"),
+                "加密映射的完成提示应指向现有 GUI 还原入口");
+        assertFalse(html.contains("restore --map"),
+                "普通用户已有 GUI 还原，不应再被引导去命令行");
+    }
+
+    @Test
+    @DisplayName("GUI 退出有保存提醒、下载防护、取消可继续和成功停轮询")
+    void guiShutdownIsGuardedAndTruthful() {
+        String html = 页面();
+        String js = 去注释(脚本());
+        for (String id : List.of("shutdownCard", "shutdownBtn", "shutdownStatus", "shutdownError")) {
+            assertTrue(html.contains("id=\"" + id + "\""), "GUI 退出缺少 " + id);
+        }
+        assertTrue(html.contains("脱敏文件和映射文件都已保存"),
+                "退出前必须明确提醒同时保存成品与映射");
+        assertTrue(js.contains("state.pendingDownloads > 0"), "文件正在下载时必须阻止退出");
+        assertTrue(js.contains("window.confirm"), "退出必须二次确认");
+        assertTrue(js.contains("已取消退出，本机服务仍可继续使用"),
+                "用户取消后应明说服务仍可用");
+        assertTrue(js.contains("fetch(\"/api/shutdown\""), "退出按钮必须调受保护的停服端点");
+        assertTrue(js.contains("stopAllPolling()"), "服务受理退出后必须停止任务与模型轮询");
+        assertTrue(js.contains("本机服务正在停止"),
+                "响应只能说正在停止，不得提前宣称已停止");
     }
 
     @Test

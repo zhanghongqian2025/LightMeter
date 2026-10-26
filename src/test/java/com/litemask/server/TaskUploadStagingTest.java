@@ -123,6 +123,7 @@ class TaskUploadStagingTest {
      */
     private static final class 攒着的执行器 extends AbstractExecutorService {
         final List<Runnable> 攒着 = new ArrayList<>();
+        boolean shutdown;
 
         @Override
         public void execute(Runnable command) {
@@ -131,26 +132,31 @@ class TaskUploadStagingTest {
 
         @Override
         public void shutdown() {
+            shutdown = true;
+            攒着.clear();
         }
 
         @Override
         public List<Runnable> shutdownNow() {
-            return List.of();
+            shutdown = true;
+            List<Runnable> queued = List.copyOf(攒着);
+            攒着.clear();
+            return queued;
         }
 
         @Override
         public boolean isShutdown() {
-            return false;
+            return shutdown;
         }
 
         @Override
         public boolean isTerminated() {
-            return false;
+            return shutdown;
         }
 
         @Override
         public boolean awaitTermination(long timeout, TimeUnit unit) {
-            return false;
+            return shutdown;
         }
     }
 

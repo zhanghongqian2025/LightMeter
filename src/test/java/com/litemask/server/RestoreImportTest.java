@@ -225,6 +225,9 @@ class RestoreImportTest {
         assertEquals(400, response.status(), response.body());
         assertTrue(response.body().contains("旧版未绑定"), response.body());
         assertTrue(response.body().contains("当前完成页"), response.body());
+        assertTrue(response.body().contains("重新处理原始文档"), response.body());
+        assertTrue(response.body().contains("新的脱敏成品"), response.body());
+        assertTrue(response.body().contains("配对的加密映射文件"), response.body());
         assertSessionEmpty();
     }
 

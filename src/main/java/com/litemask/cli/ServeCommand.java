@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * {@code serve} 子命令：启动本地 HTTP 服务。
@@ -92,8 +93,21 @@ public final class ServeCommand {
                                     List<com.litemask.core.EntitySource> sources,
                                     long maxUploadBytes, long taskTimeoutMs,
                                     com.litemask.ner.ModelManager models) throws IOException {
+        return start(workspaceDir, port, printToken, sources, maxUploadBytes,
+                taskTimeoutMs, models, null);
+    }
+
+    /** 桌面进程可注入停服信号；普通内嵌调用不注入，也就不暴露退出路由。 */
+    static LocalServer start(Path workspaceDir, int port, boolean printToken,
+                             List<com.litemask.core.EntitySource> sources,
+                             long maxUploadBytes, long taskTimeoutMs,
+                             com.litemask.ner.ModelManager models,
+                             Runnable shutdownRequest) throws IOException {
         Workspace workspace = Workspace.open(workspaceDir, maxUploadBytes);
         LocalServer server = LocalServer.create(workspace, port);
+        if (shutdownRequest != null) {
+            server.onShutdownRequest(shutdownRequest);
+        }
         List<Rule> rules = ApiHandlers.defaultRules();
         com.litemask.core.ExclusiveGate gate = models == null
                 ? com.litemask.core.ExclusiveGate.NONE : models;
@@ -221,15 +235,11 @@ public final class ServeCommand {
         com.litemask.ner.NerModelRegistry registry = models.registry();
         com.litemask.ner.NerModelRegistry.set(registry);
 
+        ServiceLifecycle lifecycle = new ServiceLifecycle(models);
         LocalServer server = start(workspaceDir, port, printToken, List.of(models.source()),
-                maxUploadBytes, taskTimeoutMs, models);
-        CountDownLatch forever = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            server.close();
-            server.workspace().close();
-            models.close();
-            forever.countDown();
-        }, "litemask-shutdown"));
+                maxUploadBytes, taskTimeoutMs, models, lifecycle::requestStop);
+        lifecycle.attach(server);
+        Runtime.getRuntime().addShutdownHook(new Thread(lifecycle::cleanup, "litemask-shutdown"));
 
         // ---- 安装目录被动过 → 自己让位 ----------------------------------
         // 【为什么需要这一步】
@@ -242,22 +252,8 @@ public final class ServeCommand {
         //   → 这里让程序**自己**看见「安装器来了」，自己把资源交还、自己退出。
         //   用户什么都不用做：不用找进程、不用执行命令。
         InstallWatcher.start(() -> {
-            try {
-                server.close();
-            } catch (RuntimeException ignored) {
-                // 关不掉也得退出：留着进程只会让安装继续失败
-            }
-            try {
-                server.workspace().close();
-            } catch (RuntimeException ignored) {
-                // 同上
-            }
-            try {
-                models.close();
-            } catch (RuntimeException ignored) {
-                // 同上
-            }
             System.out.println("检测到安装程序正在更新本程序，正在退出以完成升级。");
+            lifecycle.requestStop();
         });
 
         System.out.println("本地脱敏服务已启动");
@@ -290,11 +286,56 @@ public final class ServeCommand {
         }
         System.out.println("按 Ctrl-C 停止。");
         try {
-            forever.await();
+            lifecycle.awaitStop();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        } finally {
+            lifecycle.cleanup();
         }
         return 0;
+    }
+
+    /** GUI、安装器与 JVM shutdown hook 共用的单次清理器。 */
+    private static final class ServiceLifecycle {
+        private final CountDownLatch stop = new CountDownLatch(1);
+        private final AtomicBoolean cleaned = new AtomicBoolean();
+        private final com.litemask.ner.ModelManager models;
+        private volatile LocalServer server;
+
+        ServiceLifecycle(com.litemask.ner.ModelManager models) {
+            this.models = models;
+        }
+
+        void attach(LocalServer server) {
+            this.server = server;
+        }
+
+        void requestStop() {
+            stop.countDown();
+        }
+
+        void awaitStop() throws InterruptedException {
+            stop.await();
+        }
+
+        void cleanup() {
+            requestStop();
+            if (!cleaned.compareAndSet(false, true)) {
+                return;
+            }
+            LocalServer current = server;
+            try {
+                if (current != null) {
+                    try {
+                        current.close();
+                    } finally {
+                        current.workspace().close();
+                    }
+                }
+            } finally {
+                models.close();
+            }
+        }
     }
 
     /** 打开浏览器。失败一律吞掉——打不开浏览器不该让一个后台服务起不来。 */

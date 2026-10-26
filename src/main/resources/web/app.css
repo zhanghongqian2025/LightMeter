@@ -167,6 +167,8 @@ button, .primary {
 }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.ghost { background: #fff; color: var(--muted); }
+button.danger { background: #fff; border-color: #b42318; color: #b42318; }
+.shutdown-card { border-color: #efc2bd; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 button:not(:disabled):hover { filter: brightness(.97); }
 

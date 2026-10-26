@@ -24,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -106,6 +107,47 @@ class LocalServerApiTest {
     void 静态资源同源可达() throws Exception {
         assertEquals(200, Raw.get(port, "/app.js").status);
         assertEquals(200, Raw.get(port, "/app.css").status);
+    }
+
+    @Test
+    @DisplayName("未注入桌面生命周期回调时不暴露停服路由")
+    void embeddedServerHasNoShutdownRoute() throws Exception {
+        assertFalse(server.routeSummary().contains("POST /api/shutdown [写]"));
+        assertEquals(404, Raw.req(port, "POST", "/api/shutdown",
+                "127.0.0.1:" + port, null, token, new byte[0]).status());
+    }
+
+    @Test
+    @DisplayName("注入生命周期后停服路由仍要同源+令牌，响应完整后才发信号")
+    void shutdownRouteIsProtectedAndSignalsAfterResponse(@TempDir Path tmp) throws Exception {
+        Workspace isolatedWorkspace = Workspace.open(tmp.resolve("shutdown-route"));
+        LocalServer isolated = LocalServer.create(isolatedWorkspace, 0);
+        AtomicInteger signals = new AtomicInteger();
+        isolated.onShutdownRequest(signals::incrementAndGet);
+        ApiHandlers.register(isolated, isolatedWorkspace, ApiHandlers.defaultRules());
+        isolated.start();
+        try {
+            int isolatedPort = isolated.port();
+            String isolatedToken = isolated.policy().token();
+            Raw.Res crossOrigin = Raw.req(isolatedPort, "POST", "/api/shutdown",
+                    "127.0.0.1:" + isolatedPort, "https://evil.example", isolatedToken, new byte[0]);
+            assertEquals(403, crossOrigin.status(), crossOrigin.body());
+            assertEquals(0, signals.get(), "被拒绝的跨源请求不得发停服信号");
+
+            Raw.Res accepted = Raw.req(isolatedPort, "POST", "/api/shutdown",
+                    "127.0.0.1:" + isolatedPort, null, isolatedToken, new byte[0]);
+            assertEquals(200, accepted.status(), accepted.body());
+            assertTrue(accepted.body().contains("\"stopping\":true"), accepted.body());
+            for (int i = 0; i < 100 && signals.get() == 0; i++) {
+                Thread.sleep(5);
+            }
+            assertEquals(1, signals.get(), "完整返回停服 JSON 后应只发一次生命周期信号");
+            assertEquals(200, Raw.get(isolatedPort, "/api/health").status(),
+                    "回调只是信号，HTTP 请求线程不得自己关服务");
+        } finally {
+            isolated.close();
+            isolatedWorkspace.close();
+        }
     }
 
     // ---------------------------------------------------------------- 主机绑定

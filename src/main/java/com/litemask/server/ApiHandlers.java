@@ -150,6 +150,9 @@ public final class ApiHandlers {
                 ex -> restoreImport(ex, workspace, restoreImports));
         server.route("POST", "/api/restore-import-cancel", true,
                 ex -> restoreImportCancel(ex, restoreImports));
+        if (server.shutdownRequestEnabled()) {
+            server.route("POST", "/api/shutdown", true, ex -> shutdown(ex, server));
+        }
         // 异步任务。长文档不该把界面卡在「上传中」——它要能报进度、能放弃。
         // 查任务也要令牌：任务结果里是命中清单，清单里全是原值。
         server.route("POST", "/api/task-scan", true, ex -> taskScan(ex, tasks));
@@ -527,6 +530,16 @@ public final class ApiHandlers {
                         : "当前没有可取消的导入还原"));
     }
 
+    private static void shutdown(HttpExchange ex, LocalServer server) throws IOException {
+        // Http.json 会把定长响应体写完并关闭输出流。
+        // 只有它返回后才发停服信号，普通用户才能真的收到「正在停止」。
+        Http.json(ex, 200, Map.of(
+                "ok", true,
+                "stopping", true,
+                "message", "已收到退出请求。服务正在停止，运行中的任务会在安全检查点后清理。"));
+        server.requestShutdownAfterResponse();
+    }
+
     private static final long MAX_MAPPING_BYTES = 16L * 1024 * 1024;
     private static final int MAX_PASSPHRASE_CHARS = 512;
     private static final int MAX_MAPPING_ENTRIES = 10_000;
@@ -738,7 +751,7 @@ public final class ApiHandlers {
             throw new JobStore.BadRequestException(
                     "这是旧版未绑定脱敏成品的映射文件，独立还原无法安全核对配对。"
                             + "若原处理任务仍在当前完成页，请使用那里的「还原并下载」；"
-                            + "否则请用新版重新生成带成品校验的映射文件。");
+                            + "否则请用新版重新处理原始文档，生成新的脱敏成品和与其配对的加密映射文件。");
         }
         if (!(node instanceof Map<?, ?> binding)
                 || !"SHA-256".equals(binding.get("algorithm"))

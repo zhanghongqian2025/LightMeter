@@ -168,6 +168,9 @@ public final class TaskRunner implements AutoCloseable {
     private final long timeoutMs;
     /** 看门狗：定期扫一遍有没有任务超了时限。 */
     private final ScheduledExecutorService watchdog;
+    /** 让「接收任务」与「开始关闭」形成一个明确的先后边界。 */
+    private final Object lifecycleLock = new Object();
+    private volatile boolean closed;
     /** 因超时而被中止过的任务数（{@code /api/health} 如实报出来）。 */
     private final AtomicInteger timedOutCount = new AtomicInteger();
     /**
@@ -321,25 +324,27 @@ public final class TaskRunner implements AutoCloseable {
      * @throws IOException 任务表满了（同时进行的任务太多）
      */
     public Task submitScan(Workspace.StagedFile staged) throws IOException {
-        Task task;
-        try {
-            task = newTask();
-        } catch (IOException e) {
-            // 任务表满了：没人会来认领这份上传，它不能留在盘上。
-            // 留着等于「用户以为没上传成功、原文档却还在」。
-            workspace().discard(staged);
-            throw e;
+        synchronized (lifecycleLock) {
+            Task task;
+            try {
+                task = newTask();
+            } catch (IOException e) {
+                // 任务表满了或服务正在关闭：没人会来认领这份上传，它不能留在盘上。
+                // 留着等于「用户以为没上传成功、原文档却还在」。
+                workspace().discard(staged);
+                throw e;
+            }
+            tasks.put(task.taskId, task);
+            try {
+                workers.execute(() -> runScan(task, staged));
+            } catch (RuntimeException e) {
+                // 执行器拒收：任务不会跑，上传也就没人认领。
+                tasks.remove(task.taskId);
+                workspace().discard(staged);
+                throw e;
+            }
+            return task;
         }
-        tasks.put(task.taskId, task);
-        try {
-            workers.execute(() -> runScan(task, staged));
-        } catch (RuntimeException e) {
-            // 执行器拒收（池子关了）：任务不会跑，上传也就没人认领
-            tasks.remove(task.taskId);
-            workspace().discard(staged);
-            throw e;
-        }
-        return task;
     }
 
     /**
@@ -361,20 +366,31 @@ public final class TaskRunner implements AutoCloseable {
      *                  调用方不必再管它，也免得出现「谁负责擦」的悬案。
      */
     public Task submitApply(String jobId, Exclusions exclusions, char[] passphrase) throws IOException {
-        Task task = newTask();
-        tasks.put(task.taskId, task);
-        try {
-            workers.execute(() -> runApply(task, jobId, exclusions, passphrase));
-        } catch (RuntimeException e) {
-            // 执行器拒收（池子关了）：任务不会跑，口令也没人擦。
-            tasks.remove(task.taskId);
-            com.litemask.core.SecretMap.wipe(passphrase);
-            throw e;
+        synchronized (lifecycleLock) {
+            Task task;
+            try {
+                task = newTask();
+            } catch (IOException e) {
+                com.litemask.core.SecretMap.wipe(passphrase);
+                throw e;
+            }
+            tasks.put(task.taskId, task);
+            try {
+                workers.execute(() -> runApply(task, jobId, exclusions, passphrase));
+            } catch (RuntimeException e) {
+                // 执行器拒收：任务不会跑，口令也没人擦。
+                tasks.remove(task.taskId);
+                com.litemask.core.SecretMap.wipe(passphrase);
+                throw e;
+            }
+            return task;
         }
-        return task;
     }
 
     private Task newTask() throws IOException {
+        if (closed) {
+            throw new IOException("服务正在停止，不再接收新任务");
+        }
         evictFinished();
         if (tasks.size() >= MAX_TASKS) {
             // 挤不掉任何已完成的任务 = 全都在跑。此时拒绝是诚实的：
@@ -556,9 +572,44 @@ public final class TaskRunner implements AutoCloseable {
 
     @Override
     public void close() {
-        workers.shutdownNow();
+        synchronized (lifecycleLock) {
+            if (!closed) {
+                closed = true;
+                requestCancelForRunningTasks();
+                if (watchdog != null) {
+                    watchdog.shutdownNow();
+                }
+                workers.shutdownNow();
+            }
+        }
+        awaitTermination(workers);
         if (watchdog != null) {
-            watchdog.shutdownNow();
+            awaitTermination(watchdog);
+        }
+    }
+
+    private void requestCancelForRunningTasks() {
+        for (Task task : tasks.values()) {
+            synchronized (task) {
+                if (task.status == Status.RUNNING && task.context.requestCancel()) {
+                    task.cancelRequested = true;
+                }
+            }
+        }
+    }
+
+    private static void awaitTermination(ExecutorService executor) {
+        boolean interrupted = false;
+        while (!executor.isTerminated()) {
+            try {
+                executor.awaitTermination(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                interrupted = true;
+                executor.shutdownNow();
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 }

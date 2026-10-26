@@ -27,6 +27,10 @@
     taskId: null,
     taskKind: null,
     pollTimer: null,
+    pendingDownloads: 0,
+    productDownloaded: false,
+    mappingDownloaded: false,
+    stopping: false,
     // 用户手工补充的敏感词（本次处理内有效）。
     // 服务端会把它回传，这里存一份只是为了在重扫后还能显示出来。
     userTerms: []
@@ -88,6 +92,7 @@
   }
 
   function showError(id, message) {
+    if (state.stopping) { return; }
     var box = $(id);
     if (!message) {
       box.hidden = true;
@@ -178,17 +183,20 @@
   }
 
   function scheduleModelPoll() {
+    if (state.stopping) { return; }
     if (modelTimer) { clearTimeout(modelTimer); }
     modelTimer = setTimeout(refreshModel, modelPollMs());
   }
 
   function refreshModel() {
     getJson("/api/model").then(function (res) {
+      if (state.stopping) { return; }
       if (res.status === 200) {
         renderModel(res.body);
       }
       scheduleModelPoll();
     }).catch(function () {
+      if (state.stopping) { return; }
       // 连不上就下一轮再问：模型状态不是关键路径，断了不影响脱敏本身。
       scheduleModelPoll();
     });
@@ -220,6 +228,7 @@
    * 界面自己不去猜「模型是不是好了」。
    */
   function renderModel(m) {
+    if (state.stopping) { return; }
     var wasUsable = modelState ? modelState.usable : null;
     modelState = m;
 
@@ -270,6 +279,7 @@
    * → 降级必须由用户<b>明确选择</b>，而且那句话要一直挂着。
    */
   function applyModelGate() {
+    if (state.stopping) { return; }
     var usable = !!(modelState && modelState.usable);
     $("nerWarn").hidden = usable;
     if (usable) {
@@ -290,6 +300,7 @@
   }
 
   function updateScanEnabled() {
+    if (state.stopping) { return; }
     var hasFile = !!state.file;
     $("scanBtn").disabled = !(hasFile && modelGateSatisfied());
     if (!hasFile) {
@@ -316,14 +327,17 @@
     req.then(function (res) {
       return res.json().then(function (j) { return { status: res.status, body: j }; });
     }).then(function (res) {
+      if (state.stopping) { return; }
       if (res.status === 200 && res.body && res.body.state) {
         renderModel(res.body);
       } else {
         showError("modelError", (res.body && res.body.error) || ("操作失败：" + res.status));
       }
     }).catch(function (e) {
+      if (state.stopping) { return; }
       showError("modelError", "操作失败：" + e);
     }).then(function () {
+      if (state.stopping) { return; }
       if (button) { button.disabled = false; }
       scheduleModelPoll();
     });
@@ -351,6 +365,7 @@
     showError("modelError", "");
     $("modelImportBtn").disabled = true;
     postFile("/api/model/import", f).then(function (res) {
+      if (state.stopping) { return; }
       if (res.status === 200 && res.body && res.body.state) {
         renderModel(res.body);
       } else {
@@ -360,6 +375,7 @@
       $("modelFile").value = "";
       scheduleModelPoll();
     }).catch(function (e) {
+      if (state.stopping) { return; }
       showError("modelError", "安装失败：" + e);
       $("modelImportBtn").disabled = false;
       $("modelFile").value = "";
@@ -422,6 +438,7 @@
     连击 = 0;
     showTask(kind);
     submit().then(function (res) {
+      if (state.stopping) { return; }
       if (res.status !== 202 || !res.body.ok || !res.body.taskId) {
         failTask(res.body && res.body.error ? res.body.error : ("服务返回 " + res.status));
         return;
@@ -429,6 +446,7 @@
       state.taskId = res.body.taskId;
       pollTask(state.taskId, onDone);
     }).catch(function (e) {
+      if (state.stopping) { return; }
       failTask("无法连接本地服务：" + e);
     });
   }
@@ -462,12 +480,14 @@
    * 收在一处之后，「有没有东西可应用」就只剩一个判据：{@code state.jobId}。
    */
   function syncButtons() {
+    if (state.stopping) { return; }
     $("file").disabled = false;
     $("scanBtn").disabled = !state.file;
     $("applyBtn").disabled = !state.jobId;
   }
 
   function hideTask() {
+    if (state.stopping) { return; }
     $("taskCard").hidden = true;
     $("file").disabled = false;
     state.taskId = null;
@@ -485,7 +505,9 @@
    * 服务一慢，请求就叠在一起，界面上看到的进度会开始倒退。
    */
   function pollTask(taskId, onDone) {
+    if (state.stopping) { return; }
     getJson("/api/task?taskId=" + encodeURIComponent(taskId)).then(function (res) {
+      if (state.stopping) { return; }
       连击 = 0;
       if (res.status !== 200 || !res.body.ok) {
         failTask(res.body && res.body.error ? res.body.error : ("服务返回 " + res.status));
@@ -521,6 +543,7 @@
       // 所以按钮状态要在这里再收一次。
       syncButtons();
     }).catch(function (e) {
+      if (state.stopping) { return; }
       // 单次网络抖动不该让整个进度视图夭折：服务端那个任务还在跑，
       // 界面却先说「连不上」，用户会以为白等了。
       // 连着失败三次才认输——那时多半是服务真的没了。
@@ -571,6 +594,7 @@
       method: "POST",
       headers: headers()
     }).then(function (r) {
+      if (state.stopping) { return; }
       if (!r.ok) {
         return r.json().then(function (j) {
           throw new Error(j && j.error ? j.error : ("服务返回 " + r.status));
@@ -578,6 +602,7 @@
       }
       $("progressText").textContent = "正在取消…（跑到下一个检查点就停）";
     }).catch(function (e) {
+      if (state.stopping) { return; }
       showError("taskError", "取消失败：" + e.message);
       $("cancelBtn").disabled = false;
       $("cancelBtn").textContent = "取消";
@@ -933,6 +958,7 @@
     btn.textContent = "重扫中…";
     postJson("/api/terms", { jobId: state.jobId, terms: terms })
       .then(function (r) {
+        if (state.stopping) { return; }
         btn.disabled = false;
         btn.textContent = oldText;
         if (r.status !== 200) {
@@ -947,6 +973,7 @@
         renderResult(r.body);
       })
       .catch(function (e) {
+        if (state.stopping) { return; }
         btn.disabled = false;
         btn.textContent = oldText;
         showError("termError", "加入失败：" + e);
@@ -1023,6 +1050,8 @@
     // 「用户填了口令但服务端没封」这种情况会被显示成「已加密」，
     // 用户就会拿着一份明文映射件当成密文处理。
     state.mappingSealed = !!(result && result.mappingSealed);
+    state.productDownloaded = false;
+    state.mappingDownloaded = false;
     $("sealedNote").hidden = !state.mappingSealed;
 
     $("downloadBtn").textContent = "下载 " + result.downloadName;
@@ -1040,9 +1069,10 @@
    * <p>Blob 用完立刻 revokeObjectURL：这份字节是脱敏后的文件或含原值的映射，
    * 让它一直挂在页面上没道理。
    */
-  function 下载(path, 文件名, 按钮id, 错误id) {
+  function 下载(path, 文件名, 按钮id, 错误id, savedFlag) {
     var btn = $(按钮id);
     btn.disabled = true;
+    state.pendingDownloads += 1;
     showError(错误id, "");
     return fetch(path, { headers: headers() })
       .then(function (r) {
@@ -1062,19 +1092,21 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+        if (savedFlag) { state[savedFlag] = true; }
       })
       .catch(function (e) {
         showError(错误id, "下载失败：" + e.message);
       })
       .finally(function () {
-        btn.disabled = false;
+        state.pendingDownloads = Math.max(0, state.pendingDownloads - 1);
+        if (!state.stopping) { btn.disabled = false; }
       });
   }
 
   $("downloadBtn").addEventListener("click", function () {
     if (!state.jobId) { return; }
     下载("/api/download?jobId=" + encodeURIComponent(state.jobId),
-        state.downloadName, "downloadBtn", "applyError");
+        state.downloadName, "downloadBtn", "applyError", "productDownloaded");
   });
 
   /**
@@ -1087,7 +1119,7 @@
   $("mappingBtn").addEventListener("click", function () {
     if (!state.jobId || !state.mappingName) { return; }
     下载("/api/mapping?jobId=" + encodeURIComponent(state.jobId),
-        state.mappingName, "mappingBtn", "restoreError");
+        state.mappingName, "mappingBtn", "restoreError", "mappingDownloaded");
   });
 
   /**
@@ -1101,6 +1133,7 @@
     if (!state.jobId) { return; }
     var btn = $("restoreBtn");
     btn.disabled = true;
+    state.pendingDownloads += 1;
     showError("restoreError", "");
     fetch("/api/restore?jobId=" + encodeURIComponent(state.jobId), {
       method: "POST",
@@ -1119,6 +1152,7 @@
         });
       })
       .then(function (res) {
+        if (state.stopping) { return; }
         var url = URL.createObjectURL(res.blob);
         var a = document.createElement("a");
         a.href = url;
@@ -1132,16 +1166,19 @@
           + (res.notice ? decodeURIComponent(res.notice).split(" | ").join("；") : "");
       })
       .catch(function (e) {
+        if (state.stopping) { return; }
         showError("restoreError", "还原失败：" + e.message);
       })
       .finally(function () {
-        btn.disabled = false;
+        state.pendingDownloads = Math.max(0, state.pendingDownloads - 1);
+        if (!state.stopping) { btn.disabled = false; }
       });
   });
 
   // -------------------------------------------------------- 重启后独立还原
 
   function updateRestoreImportReady() {
+    if (state.stopping) { return; }
     var product = $("restoreProductFile").files[0];
     var mapping = $("restoreMappingFile").files[0];
     var passphrase = $("restorePass").value || "";
@@ -1162,6 +1199,7 @@
     var btn = $("restoreImportBtn");
     var cancelBtn = $("restoreImportCancelBtn");
     btn.disabled = true;
+    state.pendingDownloads += 1;
     btn.textContent = "核对并还原中…";
     cancelBtn.hidden = false;
     cancelBtn.disabled = false;
@@ -1206,6 +1244,7 @@
         });
       })
       .then(function (result) {
+        if (state.stopping) { return; }
         var lower = product.name.toLowerCase();
         var dot = lower.lastIndexOf(".");
         var name = dot > 0
@@ -1225,10 +1264,13 @@
           + (result.notice ? decodeURIComponent(result.notice).split(" | ").join("；") : "");
       })
       .catch(function (e) {
+        if (state.stopping) { return; }
         $("restoreImportStatus").textContent = "未生成还原文件。";
         showError("restoreImportError", "还原失败：" + e.message);
       })
       .finally(function () {
+        state.pendingDownloads = Math.max(0, state.pendingDownloads - 1);
+        if (state.stopping) { return; }
         btn.textContent = "核对并还原";
         cancelBtn.hidden = true;
         updateRestoreImportReady();
@@ -1242,9 +1284,11 @@
     fetch("/api/restore-import-cancel", { method: "POST", headers: headers() })
       .then(function (r) { return r.json(); })
       .then(function (result) {
+        if (state.stopping) { return; }
         $("restoreImportStatus").textContent = result.message || "已请求取消。";
       })
       .catch(function (e) {
+        if (state.stopping) { return; }
         showError("restoreImportError", "取消失败：" + e.message);
         btn.disabled = false;
       });
@@ -1258,6 +1302,8 @@
     state.mappingName = null;
     state.restoreName = null;
     state.mappingSealed = false;
+    state.productDownloaded = false;
+    state.mappingDownloaded = false;
     state.taskId = null;
     state.taskKind = null;
     $("file").value = "";
@@ -1314,7 +1360,72 @@
       }
       ul.appendChild(li);
     });
+    $("shutdownCard").hidden = (list || []).indexOf("POST /api/shutdown [写]") < 0;
   }
+
+  function stopAllPolling() {
+    stopPolling();
+    if (modelTimer) {
+      clearTimeout(modelTimer);
+      modelTimer = null;
+    }
+  }
+
+  /** 退出响应确认后，这把锁覆盖所有会触发动作的控件。 */
+  function lockControlsForStop() {
+    document.querySelectorAll("button, input").forEach(function (control) {
+      control.disabled = true;
+    });
+  }
+
+  $("shutdownBtn").addEventListener("click", function () {
+    if (state.stopping) { return; }
+    if (state.pendingDownloads > 0) {
+      $("shutdownStatus").textContent = "还有文件正在下载，请等下载结束后再退出。";
+      return;
+    }
+
+    var warnings = ["退出会停止本机服务，并清理本次会话的临时文件。"];
+    if (state.jobId && (!state.productDownloaded || !state.mappingDownloaded)) {
+      warnings.push("当前成品的脱敏文件或映射文件尚未在本页确认下载。请先保存两份文件。");
+    }
+    if (state.taskId || !$("restoreImportCancelBtn").hidden) {
+      warnings.push("正在处理的任务会被请求取消，退出可能需要等到下一个安全检查点。");
+    }
+    warnings.push("确定现在退出吗？");
+    if (!window.confirm(warnings.join("\n\n"))) {
+      $("shutdownStatus").textContent = "已取消退出，本机服务仍可继续使用。";
+      return;
+    }
+
+    var btn = $("shutdownBtn");
+    btn.disabled = true;
+    btn.textContent = "正在退出…";
+    showError("shutdownError", "");
+    fetch("/api/shutdown", { method: "POST", headers: headers() })
+      .then(function (r) {
+        return r.json().then(function (body) {
+          if (!r.ok || !body.ok || !body.stopping) {
+            throw new Error(body && body.error ? body.error : ("服务返回 " + r.status));
+          }
+          return body;
+        });
+      })
+      .then(function (body) {
+        state.stopping = true;
+        stopAllPolling();
+        setStatus(false, "本机服务正在停止…");
+        $("shutdownStatus").textContent = body.message
+          || "已收到退出请求，服务正在停止。";
+        lockControlsForStop();
+      })
+      .catch(function (e) {
+        btn.disabled = false;
+        btn.textContent = "退出本机服务";
+        showError("shutdownError", "退出请求失败：" + e.message
+          + "。本机服务尚未被确认停止。");
+      });
+  });
 
   function renderRules(rules) {
     $("ruleCount").textContent = String(rules.length);
@@ -1333,6 +1444,7 @@
   }
 
   getJson("/api/health").then(function (res) {
+    if (state.stopping) { return; }
     if (res.status !== 200 || !res.body.ok) {
       setStatus(false, "服务返回异常：" + res.status);
       return;
@@ -1342,9 +1454,11 @@
     renderPosture(b.securityPosture || {});
     renderRoutes(b.routes);
     return getJson("/api/rules").then(function (rr) {
+      if (state.stopping) { return; }
       if (rr.status === 200) { renderRules(rr.body.rules || []); }
     });
   }).catch(function (e) {
+    if (state.stopping) { return; }
     setStatus(false, "无法连接本地服务：" + e);
   });
 
