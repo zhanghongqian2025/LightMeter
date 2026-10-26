@@ -1139,6 +1139,117 @@
       });
   });
 
+  // -------------------------------------------------------- 重启后独立还原
+
+  function updateRestoreImportReady() {
+    var product = $("restoreProductFile").files[0];
+    var mapping = $("restoreMappingFile").files[0];
+    var passphrase = $("restorePass").value || "";
+    $("restoreImportBtn").disabled = !(product && mapping && passphrase);
+  }
+
+  ["restoreProductFile", "restoreMappingFile"].forEach(function (id) {
+    $(id).addEventListener("change", updateRestoreImportReady);
+  });
+  $("restorePass").addEventListener("input", updateRestoreImportReady);
+
+  $("restoreImportBtn").addEventListener("click", function () {
+    var product = $("restoreProductFile").files[0];
+    var mapping = $("restoreMappingFile").files[0];
+    var passphrase = $("restorePass").value || "";
+    if (!product || !mapping || !passphrase) { return; }
+
+    var btn = $("restoreImportBtn");
+    var cancelBtn = $("restoreImportCancelBtn");
+    btn.disabled = true;
+    btn.textContent = "核对并还原中…";
+    cancelBtn.hidden = false;
+    cancelBtn.disabled = false;
+    $("restoreImportStatus").textContent = "正在本机核对映射与脱敏文件…";
+    showError("restoreImportError", "");
+
+    // 固定结构信封，不引入通用 multipart 解析面：
+    // magic + version + 元数据长度 + 两个文件长度 + JSON 元数据 + 两个文件。
+    // File 直接作为 Blob 分段发送，浏览器不会先把两份大文件复制进 JS 数组。
+    var meta = new TextEncoder().encode(JSON.stringify({
+      productName: product.name,
+      mappingName: mapping.name,
+      passphrase: passphrase
+    }));
+    var header = new ArrayBuffer(28);
+    var view = new DataView(header);
+    view.setUint32(0, 0x4c4d5231); // "LMR1"
+    view.setUint32(4, 1);
+    view.setUint32(8, meta.byteLength);
+    view.setUint32(12, 0); view.setUint32(16, product.size);
+    view.setUint32(20, 0); view.setUint32(24, mapping.size);
+    var envelope = new Blob([header, meta, product, mapping], {
+      type: "application/octet-stream"
+    });
+    fetch("/api/restore-import", {
+      method: "POST",
+      headers: headers({ "Content-Type": "application/octet-stream" }),
+      body: envelope
+    })
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().then(function (j) {
+            throw new Error(j && j.error ? j.error : ("服务返回 " + r.status));
+          }, function () {
+            throw new Error("服务返回 " + r.status);
+          });
+        }
+        var count = r.headers.get("X-Litemask-Restored");
+        var notice = r.headers.get("X-Litemask-Notice");
+        return r.blob().then(function (blob) {
+          return { blob: blob, count: count, notice: notice };
+        });
+      })
+      .then(function (result) {
+        var lower = product.name.toLowerCase();
+        var dot = lower.lastIndexOf(".");
+        var name = dot > 0
+          ? product.name.slice(0, dot) + ".restored" + product.name.slice(dot)
+          : product.name + ".restored";
+        var url = URL.createObjectURL(result.blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        $("restorePass").value = "";
+        var n = result.count === null ? "0" : result.count;
+        $("restoreImportStatus").textContent = "已还原 " + n + " 处并下载。"
+          + (result.notice ? decodeURIComponent(result.notice).split(" | ").join("；") : "");
+      })
+      .catch(function (e) {
+        $("restoreImportStatus").textContent = "未生成还原文件。";
+        showError("restoreImportError", "还原失败：" + e.message);
+      })
+      .finally(function () {
+        btn.textContent = "核对并还原";
+        cancelBtn.hidden = true;
+        updateRestoreImportReady();
+      });
+  });
+
+  $("restoreImportCancelBtn").addEventListener("click", function () {
+    var btn = $("restoreImportCancelBtn");
+    btn.disabled = true;
+    $("restoreImportStatus").textContent = "正在请求取消；本地格式处理会在下一个安全检查点停下。";
+    fetch("/api/restore-import-cancel", { method: "POST", headers: headers() })
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        $("restoreImportStatus").textContent = result.message || "已请求取消。";
+      })
+      .catch(function (e) {
+        showError("restoreImportError", "取消失败：" + e.message);
+        btn.disabled = false;
+      });
+  });
+
   $("againBtn").addEventListener("click", function () {
     stopPolling();
     state.file = null;

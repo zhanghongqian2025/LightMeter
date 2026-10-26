@@ -123,6 +123,11 @@
         支持 docx / xlsx / pptx / pdf / ofd / txt，单个文件最大 256 MB。
         文件只在 127.0.0.1 上处理，不上传到任何地方。
       </p>
+      <p class="keep-note">
+        处理范围以<b>可解析文本</b>为主，不等于「整份文档所有内容都已脱敏」。
+        图片文字被提取出来或 PDF 存在 OCR 文本层，<b>不等于图片像素已被涂黑</b>。
+        扫描后请阅读该格式的具体限制说明。
+      </p>
     </div>
     <div class="bar">
       <button id="scanBtn" class="primary" disabled>开始扫描</button>
@@ -250,6 +255,40 @@
       还原件与原件在文本上一致，但不是同一个文件。
     </p>
     <div class="error" id="restoreError" hidden></div>
+  </section>
+
+  <!--
+    独立还原：不读取当前三步流程的 jobId。用户关闭或重启程序后，
+    仍可用之前下载的脱敏文件 + 加密映射文件 + 口令还原。
+    只有点按钮才发请求；选文件和输入口令都不会自动上传。
+  -->
+  <section class="card restore-import" id="restoreImportCard">
+    <h2>还原已保存的脱敏文件</h2>
+    <p class="muted small">
+      程序重启后也能使用。请选择<b>同一次脱敏</b>生成的脱敏文件和加密映射文件；
+      服务会核对文件长度与 SHA-256，不匹配时不会还原。
+      这里只支持<b>新版、带脱敏成品校验信息</b>的加密映射文件；
+      旧版未绑定映射无法在重启后安全确认配对，会被拒绝。
+    </p>
+    <div class="restore-files">
+      <label>脱敏文件
+        <input type="file" id="restoreProductFile" accept=".docx,.xlsx,.pptx,.pdf,.ofd,.txt">
+      </label>
+      <label>加密映射文件
+        <input type="file" id="restoreMappingFile" accept=".json,application/json">
+      </label>
+    </div>
+    <div class="passfield">
+      <label for="restorePass">映射文件口令</label>
+      <input type="password" id="restorePass" autocomplete="current-password" spellcheck="false"
+             placeholder="脱敏时设置的口令">
+    </div>
+    <div class="bar">
+      <button id="restoreImportBtn" class="primary" disabled>核对并还原</button>
+      <button id="restoreImportCancelBtn" class="ghost" hidden>取消还原</button>
+      <span class="muted small" id="restoreImportStatus">选择两个文件并输入口令后才会开始。</span>
+    </div>
+    <div class="error" id="restoreImportError" hidden></div>
   </section>
 
   <section class="card">

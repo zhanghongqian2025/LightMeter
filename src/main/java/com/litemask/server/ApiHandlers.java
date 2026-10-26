@@ -9,13 +9,30 @@ import com.sun.net.httpserver.HttpExchange;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * HTTP 接口。
@@ -63,7 +80,7 @@ public final class ApiHandlers {
         TaskRunner tasks = new TaskRunner(jobs, taskTimeoutMs);
         server.onClose(tasks);
         registerRoutes(server, workspace, rules, sources, jobs, tasks, null,
-                com.litemask.core.ExclusiveGate.NONE);
+                com.litemask.core.ExclusiveGate.NONE, taskTimeoutMs);
     }
 
     /**
@@ -97,7 +114,8 @@ public final class ApiHandlers {
                 models == null ? null : models::processingIdentity);
         TaskRunner tasks = new TaskRunner(jobs, TaskRunner.DEFAULT_TIMEOUT_MS);
         server.onClose(tasks);
-        registerRoutes(server, workspace, rules, sources, jobs, tasks, models, gate);
+        registerRoutes(server, workspace, rules, sources, jobs, tasks, models, gate,
+                TaskRunner.DEFAULT_TIMEOUT_MS);
     }
 
     /** 装配路由（共用实现）。 */
@@ -105,7 +123,10 @@ public final class ApiHandlers {
                                        List<com.litemask.core.EntitySource> sources,
                                        JobStore jobs, TaskRunner tasks,
                                        com.litemask.ner.ModelManager models,
-                                       com.litemask.core.ExclusiveGate gate) {
+                                       com.litemask.core.ExclusiveGate gate,
+                                       long taskTimeoutMs) {
+        RestoreImportGate restoreImports = new RestoreImportGate(taskTimeoutMs);
+        server.onClose(restoreImports);
         server.route("GET", "/", false, ex -> serveIndex(ex, server));
         server.route("GET", "/app.js", false, ex -> serveAsset(ex, "/web/app.js", "application/javascript; charset=utf-8"));
         server.route("GET", "/app.css", false, ex -> serveAsset(ex, "/web/app.css", "text/css; charset=utf-8"));
@@ -121,6 +142,10 @@ public final class ApiHandlers {
         // 映射件与还原。两者都要令牌：映射里全是原值，还原件里也是。
         server.route("GET", "/api/mapping", true, ex -> mapping(ex, jobs));
         server.route("POST", "/api/restore", true, ex -> restore(ex, jobs));
+        server.route("POST", "/api/restore-import", true,
+                ex -> restoreImport(ex, workspace, restoreImports));
+        server.route("POST", "/api/restore-import-cancel", true,
+                ex -> restoreImportCancel(ex, restoreImports));
         // 异步任务。长文档不该把界面卡在「上传中」——它要能报进度、能放弃。
         // 查任务也要令牌：任务结果里是命中清单，清单里全是原值。
         server.route("POST", "/api/task-scan", true, ex -> taskScan(ex, tasks));
@@ -396,6 +421,439 @@ public final class ApiHandlers {
         }
     }
 
+    /**
+     * 在重启后的新服务/工作区中导入已下载的脱敏件和加密映射件，还原后直接回传。
+     *
+     * <p>该路径不依赖 {@link JobStore} 中的当前任务，因此程序重启后仍可使用。
+     * 映射件必须是加密封装，且必须带有脱敏成品的 SHA-256/长度绑定；
+     * 密码错误、映射被改、选错成品或不认识的封装版本都在写还原件之前失败。
+     */
+    private static void restoreImport(HttpExchange ex, Workspace workspace,
+                                      RestoreImportGate gate) throws IOException {
+        try {
+            gate.execute(ctx -> restoreImportWork(ex, workspace, ctx));
+        } catch (RestoreBusyException e) {
+            Http.json(ex, 409, Map.of("ok", false, "error", e.getMessage()));
+        }
+    }
+
+    private static Void restoreImportWork(HttpExchange ex, Workspace workspace,
+                                          com.litemask.core.TaskContext context) throws IOException {
+        Path input = null;
+        Path output = null;
+        char[] passphrase = null;
+        byte[] opened = null;
+        try {
+            ImportParts parts = readRestoreEnvelope(ex, workspace, context);
+            // 读完信封后立即把暂存路径交给 finally：后续任何格式/口令/绑定失败
+            // 都必须删掉它，不能等到「开始还原」时才登记。
+            input = parts.productPath();
+            String extension = Workspace.extensionOf(parts.productName());
+            DocumentService.Format format = DocumentService.Format.of(extension);
+            if (!parts.mappingName().toLowerCase(Locale.ROOT).endsWith(".json")) {
+                throw new JobStore.BadRequestException("映射文件必须是 .json 文件");
+            }
+            if (!com.litemask.core.SecretMap.isSealed(parts.mapping())) {
+                throw new JobStore.BadRequestException(
+                        "这个映射文件不是加密封装件；请选择脱敏时设置了口令的映射文件");
+            }
+            passphrase = parts.passphrase().toCharArray();
+            opened = com.litemask.core.SecretMap.open(parts.mapping(), passphrase);
+            context.checkCancelled();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> mapFile = Json.read(opened, Map.class);
+            Map<String, String> mapping = requireMapping(mapFile);
+            verifyImportedFormat(mapFile, format);
+            verifyImportedBinding(mapFile, parts.productBytes(), parts.productSha256());
+
+            output = Files.createTempFile(workspace.sessionDir(), "restore-output-", extension);
+            DocumentService.RestoreResult restored = DocumentService.restore(
+                    input, output, format, mapping);
+            context.checkCancelled();
+            if (!context.tryCommit(() -> { })) {
+                throw new com.litemask.core.TaskContext.CanceledException();
+            }
+            ex.getResponseHeaders().set("Content-Disposition", "attachment; filename*=UTF-8''"
+                    + urlEncode(restoredName(parts.productName(), extension)));
+            ex.getResponseHeaders().set("X-Litemask-Restored", String.valueOf(restored.count()));
+            ex.getResponseHeaders().set("X-Litemask-Notice",
+                    urlEncode(String.join(" | ", restored.warnings())));
+            ex.getResponseHeaders().set("Content-Type", contentTypeOf(format));
+            ex.getResponseHeaders().set("Cache-Control", "no-store");
+            ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+            ex.getResponseHeaders().set("Referrer-Policy", "no-referrer");
+            ex.sendResponseHeaders(200, Files.size(output));
+            try (InputStream restoredBytes = Files.newInputStream(output);
+                 OutputStream response = ex.getResponseBody()) {
+                restoredBytes.transferTo(response);
+            }
+        } catch (JobStore.BadRequestException | Workspace.UnsupportedFileTypeException
+                 | DocumentService.UnsupportedFormatException e) {
+            Http.json(ex, 400, Map.of("ok", false, "error", e.getMessage()));
+        } catch (com.litemask.core.SecretMap.SecretMapException e) {
+            Http.json(ex, 400, Map.of("ok", false,
+                    "error", "映射文件打不开：" + e.getMessage()));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            Http.json(ex, 400, Map.of("ok", false,
+                    "error", "映射文件的内容不是可识别的 JSON"));
+        } catch (com.litemask.core.TaskContext.CanceledException e) {
+            Http.json(ex, 408, Map.of("ok", false,
+                    "error", "还原已取消或超过处理时限，未生成还原文件"));
+        } catch (IOException e) {
+            Http.json(ex, 400, Map.of("ok", false, "error", "还原失败：" + e.getMessage()));
+        } finally {
+            com.litemask.core.SecretMap.wipe(passphrase);
+            if (opened != null) {
+                Arrays.fill(opened, (byte) 0);
+            }
+            deleteTemporary(input);
+            deleteTemporary(output);
+        }
+        return null;
+    }
+
+    private static void restoreImportCancel(HttpExchange ex, RestoreImportGate gate) throws IOException {
+        boolean canceled = gate.cancelActive();
+        Http.json(ex, 200, Map.of("ok", true, "canceled", canceled,
+                "message", canceled ? "已请求取消，到下一个安全检查点后会清理临时文件"
+                        : "当前没有可取消的导入还原"));
+    }
+
+    private static final long MAX_MAPPING_BYTES = 16L * 1024 * 1024;
+    private static final int MAX_PASSPHRASE_CHARS = 512;
+    private static final int MAX_RESTORE_META_BYTES = 8 * 1024;
+    private static final int RESTORE_MAGIC = 0x4c4d5231; // "LMR1"
+    private static final int RESTORE_ENVELOPE_VERSION = 1;
+    private static final int RESTORE_HEADER_BYTES = Integer.BYTES * 3 + Long.BYTES * 2;
+
+    private record ImportParts(Path productPath, long productBytes, String productSha256,
+                               String productName,
+                               byte[] mapping, String mappingName, String passphrase) {
+    }
+
+    private record RestoreEnvelopeMeta(String productName, String mappingName, String passphrase) {
+    }
+
+    /**
+     * 解析固定结构的还原信封：
+     * {@code magic(4) + version(4) + metaLength(4) + productLength(8) + mapLength(8)
+     * + metaJson + product + map}。长度在切片前全部核对，不做通用表单解析。
+     */
+    private static ImportParts readRestoreEnvelope(HttpExchange ex, Workspace workspace,
+                                                   com.litemask.core.TaskContext context)
+            throws IOException, JobStore.BadRequestException {
+        JobStore.requireContentType(ex, "application/octet-stream");
+        long productLimit = workspace.maxUploadBytes();
+        long totalLimit = productLimit + MAX_MAPPING_BYTES
+                + MAX_RESTORE_META_BYTES + RESTORE_HEADER_BYTES;
+        long declaredHttpLength = contentLength(ex);
+        if (declaredHttpLength > totalLimit) {
+            throw new JobStore.BadRequestException("还原请求超过总大小上限");
+        }
+        InputStream request = ex.getRequestBody();
+        byte[] headerBytes = readExactly(request, RESTORE_HEADER_BYTES, "还原请求不完整");
+        ByteBuffer header = ByteBuffer.wrap(headerBytes).order(ByteOrder.BIG_ENDIAN);
+        int magic = header.getInt();
+        int version = header.getInt();
+        int metaLength = header.getInt();
+        long productLength = header.getLong();
+        long mappingLength = header.getLong();
+        if (magic != RESTORE_MAGIC) {
+            throw new JobStore.BadRequestException("还原请求格式不对");
+        }
+        if (version != RESTORE_ENVELOPE_VERSION) {
+            throw new JobStore.BadRequestException("不支持的还原请求版本：" + version);
+        }
+        if (metaLength <= 0 || metaLength > MAX_RESTORE_META_BYTES
+                || productLength <= 0 || productLength > productLimit
+                || mappingLength <= 0 || mappingLength > MAX_MAPPING_BYTES) {
+            throw new JobStore.BadRequestException("还原请求中的文件长度不合法");
+        }
+        long expected = (long) RESTORE_HEADER_BYTES + metaLength + productLength + mappingLength;
+        if (declaredHttpLength >= 0 && expected != declaredHttpLength) {
+            throw new JobStore.BadRequestException("还原请求的声明长度与实际内容不一致");
+        }
+        RestoreEnvelopeMeta meta;
+        try {
+            meta = Json.read(readExactly(request, metaLength, "还原请求的元数据不完整"),
+                    RestoreEnvelopeMeta.class);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new JobStore.BadRequestException("还原请求的元数据不是合法 JSON");
+        }
+        requireSafeUploadName(meta.productName(), "脱敏文件");
+        requireSafeUploadName(meta.mappingName(), "映射文件");
+        if (meta.passphrase() == null || meta.passphrase().isEmpty()
+                || meta.passphrase().length() > MAX_PASSPHRASE_CHARS) {
+            throw new JobStore.BadRequestException("请输入不超过 512 个字符的映射口令");
+        }
+        Path productPath = null;
+        boolean complete = false;
+        try {
+            productPath = Files.createTempFile(workspace.sessionDir(), "restore-import-", ".tmp");
+            MessageDigest digest = sha256Digest();
+            try (OutputStream productOut = Files.newOutputStream(productPath)) {
+                copyExactly(request, productOut, productLength, digest,
+                        "脱敏文件的实际字节少于声明长度", context);
+            }
+            byte[] mapping = readExactly(request, Math.toIntExact(mappingLength),
+                    "映射文件的实际字节少于声明长度");
+            if (request.read() != -1) {
+                throw new JobStore.BadRequestException("还原请求含有超出声明长度的多余内容");
+            }
+            context.checkCancelled();
+            complete = true;
+            return new ImportParts(productPath, productLength,
+                    HexFormat.of().formatHex(digest.digest()), meta.productName(),
+                    mapping, meta.mappingName(), meta.passphrase());
+        } finally {
+            if (!complete) {
+                deleteTemporary(productPath);
+            }
+        }
+    }
+
+    private static long contentLength(HttpExchange ex) throws JobStore.BadRequestException {
+        String value = ex.getRequestHeaders().getFirst("Content-Length");
+        if (value == null) return -1;
+        try {
+            long length = Long.parseLong(value);
+            if (length < 0) throw new NumberFormatException();
+            return length;
+        } catch (NumberFormatException e) {
+            throw new JobStore.BadRequestException("Content-Length 不合法");
+        }
+    }
+
+    private static byte[] readExactly(InputStream in, int length, String failure)
+            throws IOException, JobStore.BadRequestException {
+        byte[] bytes = in.readNBytes(length);
+        if (bytes.length != length) {
+            throw new JobStore.BadRequestException(failure);
+        }
+        return bytes;
+    }
+
+    private static void copyExactly(InputStream in, OutputStream out, long length,
+                                    MessageDigest digest, String failure,
+                                    com.litemask.core.TaskContext context)
+            throws IOException, JobStore.BadRequestException {
+        byte[] buffer = new byte[64 * 1024];
+        long remaining = length;
+        while (remaining > 0) {
+            context.checkCancelled();
+            int n = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+            if (n < 0) {
+                context.checkCancelled();
+                throw new JobStore.BadRequestException(failure);
+            }
+            if (n == 0) continue;
+            out.write(buffer, 0, n);
+            digest.update(buffer, 0, n);
+            remaining -= n;
+        }
+    }
+
+    private static void requireSafeUploadName(String filename, String label)
+            throws JobStore.BadRequestException {
+        if (filename == null || filename.isBlank() || filename.length() > 160
+                || filename.indexOf('/') >= 0 || filename.indexOf('\\') >= 0
+                || filename.equals(".") || filename.equals("..")
+                || filename.chars().anyMatch(c -> c < 0x20 || c == 0x7f)) {
+            throw new JobStore.BadRequestException(label + "的文件名不合法（不允许路径或控制字符）");
+        }
+    }
+
+    private static Map<String, String> requireMapping(Map<String, Object> mapFile)
+            throws JobStore.BadRequestException {
+        if (mapFile == null) {
+            throw new JobStore.BadRequestException("映射文件解密后不是 JSON 对象");
+        }
+        Object node = mapFile.get("mapping");
+        if (!(node instanceof Map<?, ?> raw)) {
+            throw new JobStore.BadRequestException("映射文件里没有可用的 mapping 段");
+        }
+        Map<String, String> mapping = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : raw.entrySet()) {
+            if (!(entry.getKey() instanceof String key) || !(entry.getValue() instanceof String value)) {
+                throw new JobStore.BadRequestException("映射文件的 mapping 段格式不对");
+            }
+            mapping.put(key, value);
+        }
+        return Map.copyOf(mapping);
+    }
+
+    private static void verifyImportedFormat(Map<String, Object> mapFile, DocumentService.Format actual)
+            throws JobStore.BadRequestException {
+        Object expected = mapFile.get("format");
+        if (!(expected instanceof String s) || !actual.name().equals(s)) {
+            throw new JobStore.BadRequestException("映射文件的文档格式与所选脱敏文件不一致");
+        }
+    }
+
+    private static void verifyImportedBinding(Map<String, Object> mapFile,
+                                              long productBytes, String productSha256)
+            throws JobStore.BadRequestException, IOException {
+        Object node = mapFile.get("binding");
+        if (node == null) {
+            throw new JobStore.BadRequestException(
+                    "这是旧版未绑定脱敏成品的映射文件，独立还原无法安全核对配对。"
+                            + "若原处理任务仍在当前完成页，请使用那里的「还原并下载」；"
+                            + "否则请用新版重新生成带成品校验的映射文件。");
+        }
+        if (!(node instanceof Map<?, ?> binding)
+                || !"SHA-256".equals(binding.get("algorithm"))
+                || !(binding.get("sha256") instanceof String expected)
+                || !expected.matches("[0-9a-f]{64}")
+                || !isBoundedWholeBytes(binding.get("bytes"))) {
+            throw new JobStore.BadRequestException(
+                    "映射文件缺少可识别的脱敏成品绑定，不能安全还原");
+        }
+        long expectedBytes = ((Number) binding.get("bytes")).longValue();
+        if (expectedBytes != productBytes || !expected.equals(productSha256)) {
+            throw new JobStore.BadRequestException(
+                    "这个映射文件不属于所选脱敏文件（长度或 SHA-256 不一致）");
+        }
+    }
+
+    private static boolean isBoundedWholeBytes(Object value) {
+        if (!(value instanceof Byte || value instanceof Short
+                || value instanceof Integer || value instanceof Long)) {
+            return false;
+        }
+        long bytes = ((Number) value).longValue();
+        return bytes >= 0 && bytes <= Workspace.MAX_UPLOAD_BYTES;
+    }
+
+    private static MessageDigest sha256Digest() throws IOException {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("运行时没有 SHA-256，无法核对映射件", e);
+        }
+    }
+
+    private static String restoredName(String productName, String extension) {
+        String base = productName.substring(0, productName.length() - extension.length());
+        return base + ".restored" + extension;
+    }
+
+    private static void deleteTemporary(Path path) {
+        if (path == null) return;
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // 会话退出还会整棵清理；单次删除失败不能覆盖还原结果。
+        }
+    }
+
+    /**
+     * 独立导入还原的单任务生命周期。重型工作跑在一条自有线程上，
+     * 全服务同时只允许一份，因此四条 HTTP 线程不会被四份 PBKDF/文档还原同时占满。
+     * 取消是协作式的：底层本地格式库不保证立即中断，但入场、上传流、验密后、
+     * 格式还原后和结果提交前都有检查点，取消赢得提交竞态时只清理、不交付。
+     */
+    private static final class RestoreImportGate implements AutoCloseable {
+        private final Semaphore admission = new Semaphore(1, true);
+        private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "litemask-restore-import");
+            t.setDaemon(true);
+            return t;
+        });
+        private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "litemask-restore-timeout");
+            t.setDaemon(true);
+            return t;
+        });
+        private final AtomicReference<com.litemask.core.TaskContext> active = new AtomicReference<>();
+        private final long timeoutMs;
+        private volatile boolean closed;
+
+        RestoreImportGate(long timeoutMs) {
+            this.timeoutMs = timeoutMs;
+        }
+
+        void execute(RestoreBody body) throws IOException, RestoreBusyException {
+            if (closed || !admission.tryAcquire()) {
+                throw new RestoreBusyException(closed
+                        ? "还原服务正在关闭"
+                        : "已有一份文件正在还原，请等它完成或取消后再试");
+            }
+            com.litemask.core.TaskContext context = com.litemask.core.TaskContext.create(null);
+            active.set(context);
+            ScheduledFuture<?> timeout = timeoutMs > 0
+                    ? timer.schedule(context::requestCancel, timeoutMs, TimeUnit.MILLISECONDS)
+                    : null;
+            Future<Void> future;
+            try {
+                future = worker.submit(() -> com.litemask.core.TaskContext.in(
+                        context, () -> body.run(context)));
+            } catch (RuntimeException e) {
+                if (timeout != null) timeout.cancel(false);
+                active.compareAndSet(context, null);
+                admission.release();
+                throw new IOException("还原服务无法接收任务", e);
+            }
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        future.get();
+                        break;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                        context.requestCancel();
+                        // HTTP 处理线程被关闭中断时，仍等自有工作线程走到 finally：
+                        // 提前释放入场或删文件会与它继续写相互竞争。
+                    } catch (ExecutionException e) {
+                        Throwable cause = e.getCause();
+                        if (cause instanceof IOException io) throw io;
+                        if (cause instanceof RuntimeException runtime) throw runtime;
+                        throw new IOException("还原任务失败", cause);
+                    }
+                }
+            } finally {
+                if (timeout != null) timeout.cancel(false);
+                active.compareAndSet(context, null);
+                admission.release();
+                if (interrupted) Thread.currentThread().interrupt();
+            }
+        }
+
+        boolean cancelActive() {
+            com.litemask.core.TaskContext context = active.get();
+            return context != null && context.requestCancel();
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            cancelActive();
+            timer.shutdownNow();
+            worker.shutdownNow();
+            boolean interrupted = false;
+            while (!worker.isTerminated()) {
+                try {
+                    worker.awaitTermination(1, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                    cancelActive();
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
+
+    @FunctionalInterface
+    private interface RestoreBody {
+        Void run(com.litemask.core.TaskContext context) throws IOException;
+    }
+
+    private static final class RestoreBusyException extends Exception {
+        RestoreBusyException(String message) {
+            super(message);
+        }
+    }
+
     private static Map<String, String> parseQuery(String rawQuery) {
         Map<String, String> out = new LinkedHashMap<>();
         if (rawQuery == null || rawQuery.isEmpty()) {
@@ -436,7 +894,11 @@ public final class ApiHandlers {
     }
 
     private static String contentTypeOf(JobStore.Job job) {
-        return switch (job.format) {
+        return contentTypeOf(job.format);
+    }
+
+    private static String contentTypeOf(DocumentService.Format format) {
+        return switch (format) {
             case PDF -> "application/pdf";
             case OFD -> "application/ofd";
             case DOCX -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document";

@@ -8,10 +8,14 @@ import com.litemask.core.ToolIdentity;
 import com.sun.net.httpserver.HttpExchange;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -749,7 +753,8 @@ public final class JobStore {
         MappingArtifact mapping = null;
         try {
             TaskContext.current().checkCancelled();
-            mapping = writeMapping(job, applied, appliedIdentity, passphrase);
+            mapping = writeMapping(job, applied, appliedIdentity,
+                    workspace.pathOf(outputName), passphrase);
             MappingArtifact readyMapping = mapping;
             boolean committed = TaskContext.current().tryCommit(() -> {
                 // 成品和映射都已安全落盘后，才在线性化边界内发布可下载状态。
@@ -802,12 +807,18 @@ public final class JobStore {
      */
     private MappingArtifact writeMapping(Job job, DocumentService.Result applied,
                                          ProcessingIdentity appliedIdentity,
+                                         Path redactedProduct,
                                          char[] passphrase) throws IOException {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("mapping", applied.mapping());
         payload.put("format", job.format.name());
         payload.put("source", job.displayName);
         payload.put("toolIdentity", identityMap(appliedIdentity));
+        Map<String, Object> binding = new LinkedHashMap<>();
+        binding.put("algorithm", "SHA-256");
+        binding.put("sha256", sha256(redactedProduct));
+        binding.put("bytes", Files.size(redactedProduct));
+        payload.put("binding", binding);
         List<Map<String, Object>> changes = new ArrayList<>();
         for (DocumentService.HitItem h : applied.hits()) {
             Map<String, Object> item = new LinkedHashMap<>();
@@ -855,6 +866,22 @@ public final class JobStore {
     }
 
     private record MappingArtifact(String name, boolean sealed) {
+    }
+
+    private static String sha256(Path file) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream in = Files.newInputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buffer)) >= 0) {
+                    if (n > 0) digest.update(buffer, 0, n);
+                }
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("运行时没有 SHA-256，无法绑定映射件", e);
+        }
     }
 
     /** 取映射件的字节，供下载。 */

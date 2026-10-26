@@ -178,7 +178,8 @@ class WebUiTest {
     void 接口路径对得上() {
         String js = 去注释(脚本());
         for (String path : List.of("/api/task-scan", "/api/task-apply", "/api/task",
-                "/api/task-cancel", "/api/download", "/api/mapping", "/api/restore")) {
+                "/api/task-cancel", "/api/download", "/api/mapping", "/api/restore",
+                "/api/restore-import", "/api/restore-import-cancel")) {
             assertTrue(js.contains(path), "脚本未调用 " + path);
         }
         // 令牌必须走自定义头，不能拼进 URL
@@ -208,7 +209,8 @@ class WebUiTest {
     void 写接口都有入口() {
         String js = 去注释(脚本());
         for (String path : List.of("/api/task-scan", "/api/task-apply", "/api/task",
-                "/api/task-cancel", "/api/download", "/api/mapping", "/api/restore")) {
+                "/api/task-cancel", "/api/download", "/api/mapping", "/api/restore",
+                "/api/restore-import", "/api/restore-import-cancel")) {
             assertTrue(js.contains(path), path + " 已在服务端交付，界面上却没有入口");
         }
     }
@@ -698,6 +700,25 @@ class WebUiTest {
                 "应从响应头读出还原了几处");
         assertTrue(js.contains("已还原 "),
                 "界面上要显示还原处数");
+    }
+
+    @Test
+    @DisplayName("重启后独立还原：两个文件+口令+手动按钮的接线完整")
+    void 独立还原有完整入口() {
+        String html = 页面();
+        String js = 去注释(脚本());
+        for (String id : List.of("restoreImportCard", "restoreProductFile", "restoreMappingFile",
+                "restorePass", "restoreImportBtn", "restoreImportCancelBtn",
+                "restoreImportStatus", "restoreImportError")) {
+            assertTrue(html.contains("id=\"" + id + "\""), "独立还原缺少 " + id);
+        }
+        assertTrue(js.contains("fetch(\"/api/restore-import\""), "按钮必须调独立还原端点");
+        assertTrue(js.contains("application/octet-stream"), "应使用有界二进制信封");
+        assertTrue(js.contains("fetch(\"/api/restore-import-cancel\""),
+                "同步还原必须能用另一条 HTTP 线程请求协作取消");
+        assertTrue(js.contains("addEventListener(\"click\""),
+                "选文件时不得自动上传，只有点按钮才发请求");
+        assertTrue(js.contains("restorePass\").value = \"\""), "口令用完应从输入框清掉");
     }
 
     @Test
