@@ -177,6 +177,8 @@ class RedactionApiTest {
         assertEquals("applied", a.get("stage").asText());
         assertEquals(1, a.get("summary").get("excluded").asInt(), apply.body());
         assertEquals(1, a.get("summary").get("distinctHits").asInt(), apply.body());
+        assertEquals(1, a.get("summary").get("redacted").asInt(),
+                "apply 结果的 hits 已排除保留值，redacted 不能再减一次: " + apply.body());
         assertEquals(scanIdentity, a.get("toolIdentity"),
                 "无模型的同一次处理仍要把确切工具身份带到 apply 结果");
 

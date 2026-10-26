@@ -1221,7 +1221,11 @@ public final class JobStore {
         summary.put("rows", result.hits().size());
         summary.put("occurrences", result.occurrences());
         summary.put("excluded", excludedCount);
-        summary.put("redacted", values - excludedCount);
+        // apply 的 result 已经只包含真正被脱敏的值：整值排除的项根本不在 hits 里。
+        // 再减 excludedCount 会重复扣除（例如 5 个值排除 1 个，hits 已是 4，却报 3）。
+        // 逐处排除时，同一个值可以既有保留处、又有脱敏处；它仍在 hits 中，
+        // 所以「脱敏 1 个值」与「保留 1 个值」同时成立，不能相减。
+        summary.put("redacted", values);
         out.put("summary", summary);
         out.put("stats", result.stats().values());
         // notes：扫描阶段本来就有的说明 + **零命中的四种区分**。

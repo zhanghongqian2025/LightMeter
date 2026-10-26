@@ -122,6 +122,13 @@ class PositionExclusionTest {
                 "127.0.0.1:" + port, null, token,
                 body.getBytes(StandardCharsets.UTF_8), 应用体());
         assertEquals(200, apply.status(), apply.body());
+        JsonNode applied = json(apply.body());
+        assertEquals(1, applied.path("summary").path("redacted").asInt(),
+                "同一值留 1 处、脱 2 处时，仍是脱敏了 1 个值: " + apply.body());
+        assertEquals(1, applied.path("summary").path("excluded").asInt(),
+                "逐处保留的计数应保留: " + apply.body());
+        assertEquals(2, applied.path("summary").path("occurrences").asInt(),
+                "实际脱敏的是前后两处: " + apply.body());
 
         String xml = 下载正文(jobId);
         assertEquals(1, 出现次数(xml, PHONE),
