@@ -351,6 +351,13 @@ public final class ModelPackageStore {
 
             // 版本键用**权威**的 id（校验器给的），不用再读一遍清单。
             String key = key(installed.modelId(), staging);
+            if (!allowUnsigned && sameVerifiedPackageIsActive(zip, key)) {
+                if (!ModelPackageInstaller.deleteRecursively(staging)) {
+                    throw new IOException("重复模型包的暂存目录删不掉：" + staging);
+                }
+                return new InstallResult(key, installed.modelId(), activeDir, installed.files(),
+                        null, List.of());
+            }
             Path dest = versionsDir.resolve(key);
             if (Files.exists(dest)) {
                 // 同一个内容重复装：内容一样，键也一样。把旧的清掉再放新的。
@@ -401,11 +408,16 @@ public final class ModelPackageStore {
         if (!Files.isDirectory(activeDir)) {
             throw new IOException("没有生效中的模型目录");
         }
-        String key = keyOf(activeDir);
+        return verifyProvenance(activeDir);
+    }
+
+    /** 目录内容必须能由同一内容键下保存的已签名发布包完整复现。 */
+    private Provenance verifyProvenance(Path dir) throws IOException {
+        String key = keyOf(dir);
         Path zip = receiptsDir.resolve(key + ".zip");
         Path sig = ModelTrust.signatureFileFor(zip);
         if (!Files.isRegularFile(zip) || !Files.isRegularFile(sig)) {
-            throw new IOException("当前模型没有可复验的签名收据；请从已签名模型包重新安装");
+            throw new IOException("模型没有可复验的签名收据；请从已签名模型包重新安装");
         }
         ModelTrust.verifyPackage(zip);
         Path work = Files.createTempDirectory("litemask-model-receipt-");
@@ -413,14 +425,35 @@ public final class ModelPackageStore {
         try {
             installer.install(zip, extracted);
             String expected = digest(extracted);
-            String actual = digest(activeDir);
+            String actual = digest(dir);
             if (!expected.equals(actual)) {
-                throw new IOException("当前展开模型与已签名发布包内容不一致");
+                throw new IOException("展开模型与已签名发布包内容不一致");
             }
             ModelPackageSignature.Envelope env = ModelPackageSignature.parseEnvelope(Files.readAllBytes(sig));
             return new Provenance(key, env.sha256(), env.keyId());
         } finally {
             ModelPackageInstaller.deleteRecursively(work);
+        }
+    }
+
+    /** 已生效内容完整可信且正是同一份签名包时，重复安装是幂等操作。 */
+    private boolean sameVerifiedPackageIsActive(Path zip, String key) {
+        if (!Files.isDirectory(activeDir)) {
+            return false;
+        }
+        try {
+            Provenance active = verifyProvenance(activeDir);
+            if (!active.versionKey().equals(key)) {
+                return false;
+            }
+            Path sig = ModelTrust.signatureFileFor(zip);
+            ModelPackageSignature.Envelope incoming =
+                    ModelPackageSignature.parseEnvelope(Files.readAllBytes(sig));
+            return active.packageSha256().equals(incoming.sha256())
+                    && active.signingKeyId().equals(incoming.keyId());
+        } catch (IOException | RuntimeException e) {
+            // 生效内容或收据不完整时必须走正常换装来修复，不能误判成重复安装。
+            return false;
         }
     }
 
@@ -457,7 +490,13 @@ public final class ModelPackageStore {
             mover.move(newDir, activeDir);
             return null;
         }
-        String previousKey = keyOf(activeDir);
+        String previousKey;
+        try {
+            previousKey = keyOf(activeDir);
+        } catch (IOException | RuntimeException e) {
+            // 损坏到无法读取身份的 active 仍要保留供诊断，但不能阻止可信历史恢复。
+            previousKey = "unverified-" + UUID.randomUUID().toString().substring(0, 8);
+        }
         Path previousDest = uniquePath(versionsDir.resolve(previousKey));
         mover.move(activeDir, previousDest);
         // 挪进历史的那一刻就是它「被换下来」的时刻：把这个时刻记在目录的修改时间上，
@@ -523,10 +562,10 @@ public final class ModelPackageStore {
     public RollbackResult rollback(String selector) throws IOException {
         lock();
         try {
-            List<Version> history = historyVersions();
+            List<Version> history = verifiedRollbackVersions();
             if (history.isEmpty()) {
-                throw new IOException("没有可回退的历史版本（当前生效的是唯一一份）。"
-                        + "以后每次装新版本都会把旧版本留下来，那时就能回退了。");
+                throw new IOException("没有可回退的已验证版本。"
+                        + "历史目录中的损坏或缺少签名收据的内容会保留供诊断，但不会用于回退。");
             }
             Version target;
             if (selector == null || selector.isBlank()) {
@@ -537,7 +576,11 @@ public final class ModelPackageStore {
                 // 而真实情况是「它已经在生效了」——两句话指向完全不同的下一步。
                 List<Version> candidates = new ArrayList<>(history);
                 if (Files.isDirectory(activeDir)) {
-                    candidates.add(new Version(keyOf(activeDir), manifestId(activeDir), activeDir, true));
+                    try {
+                        candidates.add(new Version(keyOf(activeDir), manifestId(activeDir), activeDir, true));
+                    } catch (IOException | RuntimeException ignored) {
+                        // 当前内容坏到无法辨识时，仍允许按已验证历史的名字回退。
+                    }
                 }
                 target = resolve(selector, candidates);
                 if (target.active()) {
@@ -548,6 +591,16 @@ public final class ModelPackageStore {
             List<String> warnings = new ArrayList<>();
             String previousKey = activate(target.dir());
             return new RollbackResult(target.key(), target.modelId(), activeDir, previousKey, warnings);
+        } finally {
+            unlock();
+        }
+    }
+
+    /** 是否存在完整、签名可复验且与当前生效内容不同的回退版本。 */
+    public boolean hasRollbackCandidate() throws IOException {
+        lock();
+        try {
+            return !verifiedRollbackVersions().isEmpty();
         } finally {
             unlock();
         }
@@ -708,6 +761,34 @@ public final class ModelPackageStore {
         List<Version> out = new ArrayList<>();
         for (Path d : dirs) {
             out.add(new Version(d.getFileName().toString(), manifestId(d), d, false));
+        }
+        return out;
+    }
+
+    /**
+     * 只返回能由签名收据完整复现、且与当前生效内容可区分的历史。
+     * 坏目录仍由 {@link #list()} 展示和保留，供用户诊断，不在这里删除或修补。
+     */
+    private List<Version> verifiedRollbackVersions() throws IOException {
+        String activeKey = null;
+        if (Files.isDirectory(activeDir)) {
+            try {
+                activeKey = keyOf(activeDir);
+            } catch (IOException | RuntimeException ignored) {
+                // 坏 active 的身份读不出来，也不能因此遮掉一份可完整复验的历史。
+            }
+        }
+        List<Version> out = new ArrayList<>();
+        for (Version version : historyVersions()) {
+            try {
+                Provenance provenance = verifyProvenance(version.dir());
+                if (!provenance.versionKey().equals(activeKey)) {
+                    out.add(new Version(provenance.versionKey(), version.modelId(),
+                            version.dir(), false));
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // 不合格历史保留供诊断，但绝不能宣传成可回退版本或参与选择。
+            }
         }
         return out;
     }

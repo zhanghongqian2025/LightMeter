@@ -11,8 +11,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyPair;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +26,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -139,6 +142,87 @@ class ModelPackageStoreTest {
         assertEquals(first.key(), versions.get(0).key(),
                 "同一份内容 → 同一个键（内容一样 → 摘要一样）");
         assertEquals("模型-v2", versions.get(1).modelId(), "被换下来的那一版留在历史里");
+    }
+
+    @Test
+    @DisplayName("连续安装同一签名包：保持幂等，不制造同内容历史")
+    void reinstallExactSignedPackageIsIdempotent() throws Exception {
+        ModelPackageStore store = new ModelPackageStore(active);
+        Path pkg = toyZip("模型-v1");
+        ModelPackageStore.InstallResult first = store.install(pkg);
+
+        ModelPackageStore.InstallResult second = store.install(pkg);
+
+        assertEquals(first.key(), second.key());
+        assertNull(second.previousKey(), "幂等安装没有被换下来的旧版本");
+        assertEquals(1, store.list().size(), "同一签名包连续安装不能制造历史目录");
+        assertFalse(store.hasRollbackCandidate(), "没有不同的已验证内容就不能开放回退");
+    }
+
+    @Test
+    @DisplayName("损坏 active 后用原签名包修复：坏副本保留诊断但不能回退")
+    void repairedBrokenActiveIsNotRollbackCandidate() throws Exception {
+        ModelPackageStore store = new ModelPackageStore(active);
+        Path pkg = toyZip("模型-v1");
+        store.install(pkg);
+        Files.writeString(active.resolve("vocab.txt"), "损坏", StandardCharsets.UTF_8);
+
+        store.install(pkg);
+
+        assertEquals(2, store.list().size(), "坏 active 应保留在历史目录供诊断");
+        assertFalse(store.hasRollbackCandidate(), "无签名收据对应的坏历史不能宣传成可回退");
+        IOException failure = assertThrows(IOException.class, () -> store.rollback(null));
+        assertTrue(failure.getMessage().contains("没有可回退的已验证版本"), failure.getMessage());
+        assertEquals(ModelPackageStore.keyOf(active), store.verifyActiveProvenance().versionKey(),
+                "修复后的 active 仍须能通过签名收据复验");
+    }
+
+    @Test
+    @DisplayName("较新的坏历史不会遮住更早的合法回退版本")
+    void badRecentHistoryDoesNotHideVerifiedOlderVersion() throws Exception {
+        ModelPackageStore store = new ModelPackageStore(active);
+        Path v1 = toyZip("模型-v1");
+        Path v2 = toyZip("模型-v2");
+        store.install(v1);
+        store.install(v2);
+        Files.writeString(active.resolve("vocab.txt"), "损坏", StandardCharsets.UTF_8);
+        store.install(v2);
+
+        assertTrue(store.hasRollbackCandidate(), "更早的合法 v1 仍应可回退");
+        ModelPackageStore.RollbackResult result = store.rollback(null);
+        assertEquals("模型-v1", result.modelId(), "应跳过较新的坏历史并选择合法 v1");
+        assertEquals("模型-v1", ModelPackageStore.manifestId(active));
+    }
+
+    @Test
+    @DisplayName("active 身份读不出来时仍可选择并恢复可信历史")
+    void unreadableActiveDoesNotHideVerifiedHistory() throws Exception {
+        Assumptions.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        ModelPackageStore store = new ModelPackageStore(active);
+        Path v1 = toyZip("模型-v1");
+        Path v2 = toyZip("模型-v2");
+        store.install(v1);
+        store.install(v2);
+        Path unreadable = active.resolve("无法读取.bin");
+        Files.writeString(unreadable, "让 active 内容身份读取失败", StandardCharsets.UTF_8);
+        Files.setPosixFilePermissions(unreadable, PosixFilePermissions.fromString("---------"));
+        try {
+            assertThrows(IOException.class, () -> ModelPackageStore.keyOf(active),
+                    "前提：active 内容身份必须真实读取失败");
+            assertTrue(store.hasRollbackCandidate(), "坏 active 不能遮掉可信 v1 历史");
+
+            ModelPackageStore.RollbackResult result = store.rollback(null);
+
+            assertEquals("模型-v1", result.modelId());
+            assertEquals("模型-v1", ModelPackageStore.manifestId(active));
+            assertTrue(result.previousKey().startsWith("unverified-"),
+                    "无法辨识的坏 active 应以诊断名保留，实际：" + result.previousKey());
+        } finally {
+            if (Files.exists(unreadable)) {
+                Files.setPosixFilePermissions(unreadable,
+                        PosixFilePermissions.fromString("rw-------"));
+            }
+        }
     }
 
     @Test
@@ -274,7 +358,7 @@ class ModelPackageStoreTest {
         store.install(toyZip("模型-v1"));
 
         IOException e = assertThrows(IOException.class, () -> store.rollback(null));
-        assertTrue(e.getMessage().contains("没有可回退的历史版本"), "实际: " + e.getMessage());
+        assertTrue(e.getMessage().contains("没有可回退的已验证版本"), "实际: " + e.getMessage());
     }
 
     // ---------------------------------------------------------------- 删

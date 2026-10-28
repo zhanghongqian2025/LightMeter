@@ -22,6 +22,12 @@ import java.net.http.HttpResponse;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -442,7 +448,115 @@ class ModelManagerTest {
         m.bootstrapSync();
         ModelManager.Status s = m.rollback();
         assertFalse(s.usable(), "回退不成功就不该说可用");
-        assertNotNull(s.failure(), "要说清失败原因");
+        assertTrue(s.failure().contains("当前没有可用模型"), s.failure());
+        assertTrue(s.nextStep().contains("安装随附模型或选择已签名离线包"), s.nextStep());
+    }
+
+    @Test
+    @DisplayName("连续状态读取只读回退快照，不校验模型也不争抢仓库锁")
+    void 状态轮询不触发历史复验或仓库锁(@TempDir Path tmp) throws Exception {
+        KeyPair kp = ModelPackageSignature.generateKeyPair();
+        用测试信任锚(tmp.resolve("anchors.json"), kp);
+        Path bundle = tmp.resolve("bundle");
+        Path v1 = 造签名模型包(bundle, kp, "test-model-v1");
+        Path v2 = 造签名模型包(bundle, kp, "test-model-v2");
+        Path storeDir = tmp.resolve("store");
+        AtomicInteger validations = new AtomicInteger();
+        ModelPackageStore observedStore = new ModelPackageStore(storeDir, dir -> {
+            validations.incrementAndGet();
+            return ModelPackageInstaller.verifyWithModelLoader(dir);
+        }, Files::move);
+        ModelManager manager = new ModelManager(storeDir, null, bundle, observedStore);
+        manager.bootstrapSync();
+        // bundle 同时有两份时发现逻辑会选最新文件；这里直接用仓库造出可信历史，再重启刷新快照。
+        observedStore.install(v1);
+        observedStore.install(v2);
+        manager.bootstrapSync();
+        assertTrue(manager.canRollback(), "启动边界应得到可信回退快照");
+        int afterRefresh = validations.get();
+
+        CountDownLatch lockHeld = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ModelPackageStore busyStore = new ModelPackageStore(storeDir, dir -> {
+            lockHeld.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            throw new IOException("测试：只占住仓库锁，不换装");
+        }, Files::move);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> busy = pool.submit(() -> {
+            assertThrows(IOException.class, () -> busyStore.install(v1));
+        });
+        try {
+            assertTrue(lockHeld.await(5, TimeUnit.SECONDS), "前提：另一个仓库动作已拿到排他锁");
+            for (int i = 0; i < 5; i++) {
+                assertTrue(manager.canRollback());
+                assertTrue(manager.status().canRollback());
+            }
+            assertEquals(afterRefresh, validations.get(),
+                    "状态轮询不能再次解压或调用模型 validator");
+        } finally {
+            release.countDown();
+            busy.get(5, TimeUnit.SECONDS);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("只有坏历史时回退明确拒绝，并保持 active 与来源身份")
+    void 坏历史不开放回退且不改变当前模型(@TempDir Path tmp) throws IOException {
+        KeyPair kp = ModelPackageSignature.generateKeyPair();
+        用测试信任锚(tmp.resolve("anchors.json"), kp);
+        Path bundle = tmp.resolve("bundle");
+        造签名模型包(bundle, kp, "test-model-v1");
+        Path store = tmp.resolve("store");
+        ModelManager m = new ModelManager(store, null, bundle);
+        m.bootstrapSync();
+        m.installBundled();
+        Files.writeString(store.resolve("vocab.txt"), "损坏", StandardCharsets.UTF_8);
+
+        ModelManager.Status repaired = m.installBundled();
+        assertTrue(repaired.usable(), "同一签名包必须能修复损坏 active");
+        assertFalse(repaired.canRollback(), "换下来的坏 active 不能成为回退候选");
+        assertTrue(repaired.signatureVerified(), "修复后的 active 必须仍有可复验来源");
+
+        ModelManager.Status failed = m.rollback();
+
+        assertTrue(failed.usable(), "拒绝坏历史后现有 active 仍应可推理");
+        assertTrue(failed.failure().contains("没有可回退的已验证版本"), failed.failure());
+        assertTrue(failed.nextStep().contains("现有模型可以继续使用"), failed.nextStep());
+        assertEquals(repaired.modelVersionKey(), failed.modelVersionKey(), "失败回退不能改变 active 内容身份");
+        assertEquals(repaired.modelPackageSha256(), failed.modelPackageSha256(), "失败回退不能改变签名包来源");
+        assertEquals(repaired.modelSigningKeyId(), failed.modelSigningKeyId(), "失败回退不能改变签名身份");
+    }
+
+    @Test
+    @DisplayName("BROKEN 状态有可信历史时显示回退操作，并能回到 READY")
+    void 损坏当前模型仍可从可信历史恢复(@TempDir Path tmp) throws IOException {
+        KeyPair kp = ModelPackageSignature.generateKeyPair();
+        用测试信任锚(tmp.resolve("anchors.json"), kp);
+        Path bundle = tmp.resolve("bundle");
+        Path v1 = 造签名模型包(bundle, kp, "test-model-v1");
+        Path v2 = 造签名模型包(bundle, kp, "test-model-v2");
+        Path store = tmp.resolve("store");
+        ModelPackageStore repository = new ModelPackageStore(store);
+        repository.install(v1);
+        repository.install(v2);
+        Files.writeString(store.resolve("vocab.txt"), "损坏", StandardCharsets.UTF_8);
+
+        ModelManager manager = new ModelManager(store, null, bundle);
+        manager.bootstrapSync();
+        ModelManager.Status broken = manager.status();
+        assertEquals(ModelManager.State.BROKEN, broken.state());
+        assertTrue(broken.actions().contains("rollback"), "BROKEN 但有可信历史时界面必须给回退入口");
+
+        ModelManager.Status recovered = manager.rollback();
+        assertEquals(ModelManager.State.READY, recovered.state());
+        assertTrue(recovered.usable());
+        assertEquals("test-model-v1", recovered.modelId());
     }
 
     @Test

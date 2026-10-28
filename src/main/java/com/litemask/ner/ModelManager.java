@@ -205,6 +205,11 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
     private volatile String nextStep;
     private volatile boolean installedFromBundle;
     private volatile ModelPackageStore.Provenance activeProvenance;
+    /**
+     * 最近一次启动、安装或回退边界上完整复验得到的回退能力。
+     * 状态轮询只读这份快照；真正回退时 {@link ModelPackageStore#rollback(String)} 仍会重新复验。
+     */
+    private volatile boolean rollbackAvailableSnapshot;
 
     /** 生产构造：装到当前用户的数据目录。 */
     public ModelManager() {
@@ -229,10 +234,16 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
      * @param bundleDir   随附模型包所在目录；非 null 时<b>只看这一个</b>
      */
     public ModelManager(Path storeDir, Path explicitDir, Path bundleDir) {
+        this(storeDir, explicitDir, bundleDir,
+                new ModelPackageStore(Objects.requireNonNull(storeDir, "storeDir")));
+    }
+
+    /** 测试缝：允许观察仓库校验次数；生产构造始终使用上面的真实仓库。 */
+    ModelManager(Path storeDir, Path explicitDir, Path bundleDir, ModelPackageStore store) {
         this.storeDir = Objects.requireNonNull(storeDir, "storeDir").toAbsolutePath().normalize();
         this.explicitDir = explicitDir == null ? null : explicitDir.toAbsolutePath().normalize();
         this.bundleDir = bundleDir == null ? null : bundleDir.toAbsolutePath().normalize();
-        this.store = new ModelPackageStore(this.storeDir);
+        this.store = Objects.requireNonNull(store, "store");
     }
 
     // ------------------------------------------------------------------ 闸门
@@ -263,6 +274,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
             log("恢复中断的安装失败：" + e.getMessage());
         }
         loadActive();
+        refreshRollbackAvailability();
     }
 
     /**
@@ -336,6 +348,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
     public Status installBundled() {
         Optional<BundledPackage> bundled = findBundledPackage();
         if (bundled.isEmpty()) {
+            refreshRollbackAvailability();
             return markFailure(State.NOT_INSTALLED, false,
                     "安装包里没有随附的识别模型。",
                     "请用「选择离线模型包」从文件安装。");
@@ -384,6 +397,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
             return install(inner, true);
         } catch (IOException e) {
             log("离线模型包安装失败：" + e.getMessage());
+            refreshRollbackAvailability();
             return markFailure(currentStateAfterFailure(), currentlyUsable(),
                     "这个模型包装不上：" + plainLanguage(e),
                     nextStepFor(e));
@@ -415,6 +429,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
                 ModelTrust.verifyPackage(zip);
             } catch (IOException e) {
                 log("模型包验签没通过：" + e.getMessage());
+                refreshRollbackAvailability();
                 return markFailure(hadUsable ? State.UPDATE_FAILED : State.NOT_INSTALLED,
                         hadUsable,
                         hadUsable
@@ -439,6 +454,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
                 // 这里必须把它重新载起来，否则用户会从「能用」掉到「不能用」——
                 // 明明失败的那次安装压根没碰坏任何东西。
                 loadActive();
+                refreshRollbackAvailability();
                 return markFailure(hadUsable ? State.UPDATE_FAILED : State.BROKEN,
                         hadUsable,
                         hadUsable
@@ -449,6 +465,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
 
             // ---- 第 4 步：真的加载一次，确认推理引擎可用 ----
             loadActive();
+            refreshRollbackAvailability();
             if (!isModelUsable()) {
                 // 装得上但加载不了：这是**损坏**，不是「可用」。
                 return markFailure(State.BROKEN, false,
@@ -479,12 +496,23 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
             } catch (IOException e) {
                 log("回退失败：" + e.getMessage());
                 loadActive();
-                return markFailure(currentStateAfterFailure(), currentlyUsable(),
-                        "回退失败：" + plainLanguage(e),
-                        "请点「重试」再试一次。");
+                refreshRollbackAvailability();
+                boolean usableAfterReload = currentlyUsable();
+                boolean noVerifiedHistory = e.getMessage() != null
+                        && e.getMessage().contains("没有可回退的已验证版本");
+                return markFailure(usableAfterReload ? State.UPDATE_FAILED : State.BROKEN,
+                        usableAfterReload,
+                        "回退失败：" + plainLanguage(e)
+                                + (usableAfterReload ? "现有模型仍可继续使用。" : "当前没有可用模型。"),
+                        !usableAfterReload
+                                ? "当前没有可用模型，请安装随附模型或选择已签名离线包。"
+                                : noVerifiedHistory
+                                        ? "当前没有可回退的已验证版本；现有模型可以继续使用。"
+                                        : "请点「重试」再试一次。");
             }
             log("已回退到版本 " + r.key());
             loadActive();
+            refreshRollbackAvailability();
             if (!isModelUsable()) {
                 return markFailure(State.BROKEN, false,
                         "回退后模型没能加载成功。",
@@ -520,14 +548,15 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
                 org = supports(m, "organization");
             }
         }
+        boolean rollbackAvailable = rollbackAvailableSnapshot;
         List<String> actions = new ArrayList<>();
         if (state == State.READY) {
             actions.add("update");
-            if (canRollback()) {
-                actions.add("rollback");
-            }
         } else {
             actions.add("install");
+        }
+        if (rollbackAvailable && state != State.INSTALLING && state != State.VERIFYING) {
+            actions.add("rollback");
         }
         actions.add("import");
         Optional<BundledPackage> bundled = findBundledPackage();
@@ -543,7 +572,7 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
                 actions,
                 bundled.isPresent(),
                 bundled.map(BundledPackage::modelId).orElse(null),
-                canRollback(),
+                rollbackAvailable,
                 failure);
     }
 
@@ -874,16 +903,25 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
      * @return 有就 true
      */
     public boolean canRollback() {
+        return rollbackAvailableSnapshot;
+    }
+
+    /**
+     * 只在模型生命周期边界刷新；避免 GUI 每五秒轮询时反复验签、解压并加载所有历史模型。
+     * 外部直接改文件最多让按钮短暂陈旧，真正 rollback 仍会在仓库锁内 fail-closed 地重验。
+     */
+    private void refreshRollbackAvailability() {
+        lock.writeLock().lock();
         try {
-            for (ModelPackageStore.Version v : store.list()) {
-                if (!v.active()) {
-                    return true;
-                }
+            try {
+                rollbackAvailableSnapshot = explicitDir == null && store.hasRollbackCandidate();
+            } catch (IOException e) {
+                rollbackAvailableSnapshot = false;
+                log("看历史版本时出错：" + e.getMessage());
             }
-        } catch (IOException e) {
-            log("看历史版本时出错：" + e.getMessage());
+        } finally {
+            lock.writeLock().unlock();
         }
-        return false;
     }
 
     private boolean currentlyUsable() {
@@ -932,6 +970,9 @@ public final class ModelManager implements ExclusiveGate, AutoCloseable {
      */
     static String plainLanguage(IOException e) {
         String m = e.getMessage() == null ? "" : e.getMessage();
+        if (m.contains("没有可回退的已验证版本")) {
+            return "没有可回退的已验证版本。";
+        }
         if (m.contains("没有签名文件") || m.contains("签名文件")) {
             return "缺少验证材料，无法确认它来自发布方。";
         }
