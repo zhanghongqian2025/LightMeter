@@ -32,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * </ul>
  *
  * <p><b>为什么 Windows 侧要看「有没有别的 ALLOW」而不只是「属主有 ALLOW」</b>：
- * 只断言属主有条目的话，一个「属主 + Everyone」��� DACL 也能过 ——
+ * 只断言属主有条目的话，一个「属主 + Everyone」的 DACL 也能过 ——
  * 而那正是「同机人人可读」。必须断言**只有**属主。
  */
 public final class OwnerOnlyAssert {

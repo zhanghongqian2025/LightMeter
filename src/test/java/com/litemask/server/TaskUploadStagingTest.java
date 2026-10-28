@@ -1,6 +1,7 @@
 package com.litemask.server;
 
 import com.litemask.docx.DocxFixture;
+import com.litemask.core.Exclusions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -16,6 +17,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -160,6 +164,24 @@ class TaskUploadStagingTest {
         }
     }
 
+    /** 单线程执行器，并把 shutdownNow 已发生做成可等待的确定事件。 */
+    private static final class 可观测单线程执行器 extends ThreadPoolExecutor {
+        final CountDownLatch 已调用立即关闭 = new CountDownLatch(1);
+
+        可观测单线程执行器() {
+            super(1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            try {
+                return super.shutdownNow();
+            } finally {
+                已调用立即关闭.countDown();
+            }
+        }
+    }
+
     // ------------------------------------------------------------ 落盘
 
     /**
@@ -289,6 +311,74 @@ class TaskUploadStagingTest {
                     "落盘的长度必须与上传一致");
         } finally {
             runner.close();
+        }
+    }
+
+    @Test
+    @DisplayName("关闭等待真实运行任务后清理排队扫描暂存件和应用口令")
+    void 关闭等待运行任务再清理排队资源() throws Exception {
+        CountDownLatch 首任务已进闸门 = new CountDownLatch(1);
+        CountDownLatch 允许首任务结束 = new CountDownLatch(1);
+        jobs = new JobStore(workspace, ApiHandlers.defaultRules(), List.of(), () -> {
+            首任务已进闸门.countDown();
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    允许首任务结束.await();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return () -> { };
+        });
+        可观测单线程执行器 池 = new 可观测单线程执行器();
+        TaskRunner runner = new TaskRunner(jobs, 池);
+        char[] 口令 = "synthetic-queued-secret".toCharArray();
+        TaskRunner.Task running = runner.submitScan(暂存("运行中.docx", docx(2)));
+        assertTrue(首任务已进闸门.await(5, TimeUnit.SECONDS), "首任务必须已绑定工作线程并进入扫描");
+
+        Workspace.StagedFile queuedStaged = 暂存("排队.docx", docx(2));
+        Path 排队暂存路径 = queuedStaged.path();
+        TaskRunner.Task queuedScan = runner.submitScan(queuedStaged);
+        TaskRunner.Task queuedApply = runner.submitApply("尚未执行的作业", Exclusions.NONE, 口令);
+        assertEquals(2, 池.getQueue().size(), "前提：首任务卡住，scan/apply 都只在队列里");
+        assertTrue(Files.exists(排队暂存路径), "前提：扫描暂存件仍由排队任务持有");
+
+        Throwable[] closeFailure = new Throwable[1];
+        Thread closeThread = new Thread(() -> {
+            try {
+                runner.close();
+            } catch (Throwable t) {
+                closeFailure[0] = t;
+            }
+        }, "task-runner-close-test");
+        closeThread.start();
+        try {
+            assertTrue(池.已调用立即关闭.await(5, TimeUnit.SECONDS), "close 必须已经淘汰排队任务");
+            assertTrue(closeThread.isAlive(), "真正运行的首任务没结束时 close 必须继续等待");
+            assertTrue(Files.exists(排队暂存路径), "等待真实运行任务期间不能提前执行排队资源清理");
+            assertNotEquals('\0', 口令[0], "等待真实运行任务期间不能提前擦除仍由排队任务持有的口令");
+        } finally {
+            允许首任务结束.countDown();
+            closeThread.join(5_000);
+        }
+        assertFalse(closeThread.isAlive(), "首任务结束后 close 必须完成无限等待并收尾");
+        if (closeFailure[0] != null) {
+            throw new AssertionError("close 失败", closeFailure[0]);
+        }
+
+        assertFalse(Files.exists(排队暂存路径), "被 shutdownNow 淘汰的扫描任务必须删除暂存原件");
+        assertEquals(TaskRunner.Status.CANCELED, running.status(), "运行任务收到关闭取消后必须进入终态");
+        assertEquals(TaskRunner.Status.CANCELED, queuedScan.status(), "排队扫描不能永远停在 running");
+        assertEquals(TaskRunner.Status.CANCELED, queuedApply.status(), "排队应用不能永远停在 running");
+        assertTrue(running.cancelRequested && queuedScan.cancelRequested && queuedApply.cancelRequested,
+                "关闭边界必须记录所有任务都收到取消请求");
+        for (char c : 口令) {
+            assertEquals('\0', c, "从未开跑的应用任务也必须擦除口令");
         }
     }
 

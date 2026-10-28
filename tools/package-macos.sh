@@ -15,6 +15,9 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 出包前先拦住脚本语法、非法 UTF-8、NUL 与未登记的 U+FFFD；
+# 编译器能通过的注释/文档损坏，也不能被带进发布源码。
+bash "$ROOT/tools/check-sources.sh" || exit 1
 . "$ROOT/tools/shell-lib.sh"
 # JDK/Maven 的位置**不再写死**：旧机器上的路径早已搬走，写死会让脚本在第一步就失败。
 . "$ROOT/tools/toolchain.sh"
@@ -789,17 +792,45 @@ fi
 unset JAVA_TOOL_OPTIONS
 
 # 6b. 无参数 = 桌面形态：起本地服务并能被外部访问
-PORT=19422
+# 先向内核申请一个当下空闲的回环端口，避免固定端口上的旧服务替本次候选答健康检查。
+PORT="$(python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+PY
+)"
+SERVE_HOME="$WS/empty-home-serve"
+mkdir -p "$SERVE_HOME"
+JAVA_TOOL_OPTIONS="-Duser.home=$SERVE_HOME" \
 "$APP/Contents/MacOS/$APP_NAME" serve --port "$PORT" --workspace "$WS/ws" --no-browser \
   > "$WS/serve.log" 2>&1 &
 SRV=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do sleep 1; curl -s -m 2 -o /dev/null "http://127.0.0.1:$PORT/api/health" && break; done
-if curl -s -m 3 "http://127.0.0.1:$PORT/api/health" | grep -q '"ok":true'; then
-  echo "    ok  .app 起服务并通过 /api/health"
+SERVE_CHALLENGE="package_probe_${SRV}_$(date +%s)"
+SERVE_RESPONSE=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  kill -0 "$SRV" 2>/dev/null || break
+  SERVE_RESPONSE="$(curl -s -m 2 -H "X-Litemask-Challenge: $SERVE_CHALLENGE" \
+    "http://127.0.0.1:$PORT/api/health" 2>/dev/null)"
+  case "$SERVE_RESPONSE" in
+    *'"ok":true'*'"service":"litemask"'*'"protocol":1'*"\"challenge\":\"$SERVE_CHALLENGE\""*) break ;;
+  esac
+done
+if kill -0 "$SRV" 2>/dev/null \
+   && grep -q "本地脱敏服务已启动" "$WS/serve.log" \
+   && grep -qF -- "-Duser.home=$SERVE_HOME" "$WS/serve.log" \
+   && printf '%s' "$SERVE_RESPONSE" | grep -qF "\"challenge\":\"$SERVE_CHALLENGE\"" \
+   && printf '%s' "$SERVE_RESPONSE" | grep -q '"service":"litemask"' \
+   && printf '%s' "$SERVE_RESPONSE" | grep -q '"protocol":1'; then
+  echo "    ok  本次 .app 子进程在隔离 home 起服务，并完成身份挑战握手"
 else
-  echo "    ng  .app 起服务失败："; sed 's/^/      /' "$WS/serve.log"; fail=1
+  echo "    ng  本次 .app 子进程未通过隔离启动或身份挑战握手："
+  sed 's/^/      /' "$WS/serve.log"
+  [ -n "$SERVE_RESPONSE" ] && printf '      最后响应：%s\n' "$SERVE_RESPONSE"
+  fail=1
 fi
-kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null
 
 # ---- 7b. 首次启动**自动**把随附模型装上（这是产品的核心承诺）--------------
 #
@@ -819,19 +850,38 @@ kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 #   而更糟的是：两个服务共用一个端口时，第二次的健康检查可能打到第一个上，
 #   于是「第二次起没起来」这件事根本没被验到。
 if [ -n "$MODEL_PACKAGE_DIR" ]; then
-  AUTO_PORT=19423
+  AUTO_PORT="$(python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+PY
+)"
   EMPTY_HOME3="$WS/empty-home3"
   mkdir -p "$EMPTY_HOME3"
   JAVA_TOOL_OPTIONS="-Duser.home=$EMPTY_HOME3" \
   "$APP/Contents/MacOS/$APP_NAME" serve --port "$AUTO_PORT" --workspace "$WS/ws2" --no-browser \
     > "$WS/serve-auto.log" 2>&1 &
   SRV2=$!
+  AUTO_CHALLENGE="package_model_probe_${SRV2}_$(date +%s)"
+  AUTO_HEALTH=""
+  AUTO_IDENTITY=""
   MODEL_READY=""
   STATE_SEEN=""
   # 装模型要解压 13MB 并把 ONNX 模型加载起来：给足 180 秒。
   i=0
   while [ $i -lt 180 ]; do
     sleep 1
+    kill -0 "$SRV2" 2>/dev/null || break
+    if [ -z "$AUTO_IDENTITY" ]; then
+      AUTO_HEALTH="$(curl -s -m 3 -H "X-Litemask-Challenge: $AUTO_CHALLENGE" \
+        "http://127.0.0.1:$AUTO_PORT/api/health" 2>/dev/null)"
+      case "$AUTO_HEALTH" in
+        *'"ok":true'*'"service":"litemask"'*'"protocol":1'*"\"challenge\":\"$AUTO_CHALLENGE\""*)
+          AUTO_IDENTITY=yes
+          ;;
+      esac
+    fi
     RESP="$(curl -s -m 3 "http://127.0.0.1:$AUTO_PORT/api/model" 2>/dev/null)"
     case "$RESP" in
       *'"state"'*)
@@ -841,19 +891,36 @@ if [ -n "$MODEL_PACKAGE_DIR" ]; then
           echo "    模型状态：$ST"
         fi
         case "$RESP" in
-          *'"state":"READY"'*'"usable":true'*) MODEL_READY=yes; break ;;
+          *'"state":"READY"'*'"usable":true'*)
+            [ -n "$AUTO_IDENTITY" ] && MODEL_READY=yes && break
+            ;;
         esac
         ;;
     esac
     i=$((i + 1))
   done
-  kill $SRV2 2>/dev/null; wait $SRV2 2>/dev/null
-  if [ -n "$MODEL_READY" ]; then
-    echo "    ok  首次启动自动把随附模型装好了（空 home → 状态变成「可用」），全程不用终端"
-  else
-    echo "    ng  首次启动没有自动装好模型（最后状态：$STATE_SEEN）"
-    sed 's/^/      /' "$WS/serve-auto.log"; fail=1
+  ACTIVE_MODEL_DIR="$EMPTY_HOME3/.litemask/models/ner"
+  MODEL_RECEIPTS_DIR="$EMPTY_HOME3/.litemask/models/ner.receipts"
+  RECEIPT_PAIRS=0
+  if [ -d "$MODEL_RECEIPTS_DIR" ]; then
+    while IFS= read -r receipt; do
+      [ -f "$receipt.sig" ] && RECEIPT_PAIRS=$((RECEIPT_PAIRS + 1))
+    done < <(find "$MODEL_RECEIPTS_DIR" -maxdepth 1 -type f -name '*.zip' | LC_ALL=C sort)
   fi
+  if [ -n "$MODEL_READY" ] \
+     && kill -0 "$SRV2" 2>/dev/null \
+     && grep -q "本地脱敏服务已启动" "$WS/serve-auto.log" \
+     && grep -qF -- "-Duser.home=$EMPTY_HOME3" "$WS/serve-auto.log" \
+     && [ -f "$ACTIVE_MODEL_DIR/manifest.json" ] \
+     && [ "$RECEIPT_PAIRS" -ge 1 ]; then
+    echo "    ok  本次 .app 子进程在空 home 自动装好随附模型，并留下展开模型与签名收据"
+  else
+    echo "    ng  首次启动自动装模验证失败（最后状态：$STATE_SEEN，签名收据对：$RECEIPT_PAIRS）"
+    sed 's/^/      /' "$WS/serve-auto.log"
+    [ -n "$AUTO_HEALTH" ] && printf '      最后健康响应：%s\n' "$AUTO_HEALTH"
+    fail=1
+  fi
+  kill "$SRV2" 2>/dev/null; wait "$SRV2" 2>/dev/null
 fi
 rm_rf "$WS"
 

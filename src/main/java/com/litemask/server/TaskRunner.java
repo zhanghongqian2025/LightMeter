@@ -165,6 +165,15 @@ public final class TaskRunner implements AutoCloseable {
     private final JobStore jobs;
     private final ExecutorService workers;
     private final Map<String, Task> tasks = new ConcurrentHashMap<>();
+    /**
+     * 尚未被工作线程接管的任务资源。
+     *
+     * <p>{@link ExecutorService#shutdownNow()} 会把仍在队列里的任务直接淘汰，
+     * 它们不会进入 {@code runScan/runApply} 的 {@code finally}。因此排队期也必须有
+     * 一个明确的资源所有者：工作线程开跑时原子取走清理责任；关闭淘汰队列时，
+     * 由关闭线程取走。谁先 {@link Map#remove(Object)} 成功，谁负责且只负责一次。
+     */
+    private final Map<String, Runnable> pendingCleanup = new ConcurrentHashMap<>();
     private final long timeoutMs;
     /** 看门狗：定期扫一遍有没有任务超了时限。 */
     private final ScheduledExecutorService watchdog;
@@ -335,12 +344,20 @@ public final class TaskRunner implements AutoCloseable {
                 throw e;
             }
             tasks.put(task.taskId, task);
+            pendingCleanup.put(task.taskId, () -> workspace().discard(staged));
             try {
-                workers.execute(() -> runScan(task, staged));
+                workers.execute(() -> {
+                    // 从这一刻起，runScan 的 finally 接管暂存件。
+                    pendingCleanup.remove(task.taskId);
+                    runScan(task, staged);
+                });
             } catch (RuntimeException e) {
                 // 执行器拒收：任务不会跑，上传也就没人认领。
                 tasks.remove(task.taskId);
-                workspace().discard(staged);
+                Runnable cleanup = pendingCleanup.remove(task.taskId);
+                if (cleanup != null) {
+                    cleanup.run();
+                }
                 throw e;
             }
             return task;
@@ -375,12 +392,21 @@ public final class TaskRunner implements AutoCloseable {
                 throw e;
             }
             tasks.put(task.taskId, task);
+            pendingCleanup.put(task.taskId,
+                    () -> com.litemask.core.SecretMap.wipe(passphrase));
             try {
-                workers.execute(() -> runApply(task, jobId, exclusions, passphrase));
+                workers.execute(() -> {
+                    // 从这一刻起，runApply 的 finally 接管口令。
+                    pendingCleanup.remove(task.taskId);
+                    runApply(task, jobId, exclusions, passphrase);
+                });
             } catch (RuntimeException e) {
                 // 执行器拒收：任务不会跑，口令也没人擦。
                 tasks.remove(task.taskId);
-                com.litemask.core.SecretMap.wipe(passphrase);
+                Runnable cleanup = pendingCleanup.remove(task.taskId);
+                if (cleanup != null) {
+                    cleanup.run();
+                }
                 throw e;
             }
             return task;
@@ -585,6 +611,38 @@ public final class TaskRunner implements AutoCloseable {
         awaitTermination(workers);
         if (watchdog != null) {
             awaitTermination(watchdog);
+        }
+        cleanupNeverStartedTasks();
+    }
+
+    /**
+     * 清理被 {@code shutdownNow()} 淘汰、从未绑定工作线程的任务。
+     *
+     * <p>必须在工作池真正终止之后做：若某个任务已经开跑，它会先从
+     * {@link #pendingCleanup} 取走所有权；这样关闭线程不会提前删除正在读取的原件，
+     * 也不会提前擦掉正在封装映射件的口令。
+     */
+    private void cleanupNeverStartedTasks() {
+        for (Map.Entry<String, Runnable> entry : pendingCleanup.entrySet()) {
+            String taskId = entry.getKey();
+            Runnable cleanup = pendingCleanup.remove(taskId);
+            if (cleanup == null) {
+                continue;
+            }
+            cleanup.run();
+            Task task = tasks.get(taskId);
+            if (task == null) {
+                continue;
+            }
+            synchronized (task) {
+                if (task.status == Status.RUNNING) {
+                    task.status = Status.CANCELED;
+                    task.cancelRequested = true;
+                    task.message = "已取消，没有产出任何文件";
+                    task.error = task.message;
+                    task.finishedAt = System.currentTimeMillis();
+                }
+            }
         }
     }
 

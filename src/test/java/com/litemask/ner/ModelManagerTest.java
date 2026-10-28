@@ -2,6 +2,9 @@ package com.litemask.ner;
 
 import com.litemask.core.EntitySource;
 import com.litemask.core.Match;
+import com.litemask.server.ApiHandlers;
+import com.litemask.server.LocalServer;
+import com.litemask.server.Workspace;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -12,6 +15,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyPair;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -333,6 +340,44 @@ class ModelManagerTest {
         assertTrue(s.usable(), "离线包装得上就该说可用");
         assertTrue(Files.isRegularFile(tmp.resolve("store").resolve("ner.onnx")),
                 "离线包装完应当落在用户数据目录");
+    }
+
+    @Test
+    @DisplayName("HTTP 导入合法签名离线包仍能安装")
+    void HTTP导入合法签名包(@TempDir Path tmp) throws Exception {
+        KeyPair kp = ModelPackageSignature.generateKeyPair();
+        用测试信任锚(tmp.resolve("anchors.json"), kp);
+        Path modelZip = 造签名模型包(tmp.resolve("models"), kp, "test-model-http");
+        Path bundleFile = 造离线包(tmp, modelZip);
+
+        ModelManager manager = new ModelManager(
+                tmp.resolve("store"), null, tmp.resolve("bundled"));
+        manager.bootstrapSync();
+        Workspace workspace = Workspace.open(tmp.resolve("workspace"));
+        LocalServer server = LocalServer.create(workspace, 0);
+        ApiHandlers.register(server, workspace, ApiHandlers.defaultRules(), List.of(), manager, manager);
+        server.start();
+        try {
+            byte[] body = Files.readAllBytes(bundleFile);
+            HttpRequest request = HttpRequest.newBuilder(
+                            URI.create("http://127.0.0.1:" + server.port() + "/api/model/import"))
+                    .header("Content-Type", "application/octet-stream")
+                    .header("X-Filename", "signed-offline-model.zip")
+                    .header("X-Litemask-Token", server.policy().token())
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                    .build();
+
+            HttpResponse<String> response = HttpClient.newHttpClient().send(
+                    request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
+            assertEquals(200, response.statusCode(), response.body());
+            assertTrue(response.body().contains("\"state\":\"READY\""), response.body());
+            assertTrue(manager.isModelUsable(), "HTTP 返回成功时模型必须真的已加载");
+        } finally {
+            server.close();
+            manager.close();
+            workspace.close();
+        }
     }
 
     @Test

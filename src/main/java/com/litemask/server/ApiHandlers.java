@@ -61,6 +61,9 @@ public final class ApiHandlers {
     /** 文件名在请求头里的名字。 */
     public static final String FILENAME_HEADER = "X-Filename";
 
+    /** 离线模型包的压缩上传上限；解包后仍由模型安装器的独立预算继续约束。 */
+    static final long MAX_MODEL_UPLOAD_BYTES = 512L * 1024 * 1024;
+
     private static final String INDEX_RESOURCE = "/web/index.html";
 
     private ApiHandlers() {
@@ -206,13 +209,19 @@ public final class ApiHandlers {
         Path tmp = null;
         try {
             JobStore.requireContentType(ex, "application/octet-stream");
-            String name = JobStore.clientFileName(ex);
+            JobStore.clientFileName(ex);
+            long declared = requireSingleContentLength(ex);
+            if (declared > MAX_MODEL_UPLOAD_BYTES) {
+                throw new ModelUploadTooLargeException(declared, MAX_MODEL_UPLOAD_BYTES);
+            }
             tmp = Files.createTempFile("litemask-model-upload-", ".zip");
             try (InputStream in = ex.getRequestBody();
                  java.io.OutputStream out = Files.newOutputStream(tmp)) {
-                in.transferTo(out);
+                copyModelUpload(in, out, MAX_MODEL_UPLOAD_BYTES);
             }
             Http.json(ex, 200, modelJson(models.importOffline(tmp)));
+        } catch (ModelUploadTooLargeException e) {
+            Http.json(ex, 413, Map.of("ok", false, "error", e.getMessage()));
         } catch (JobStore.BadRequestException e) {
             Http.json(ex, 400, Map.of("ok", false, "error", e.getMessage()));
         } catch (IOException e) {
@@ -226,6 +235,52 @@ public final class ApiHandlers {
                     // 删不掉不算失败
                 }
             }
+        }
+    }
+
+    /** 模型导入必须有唯一、严格十进制的长度声明，才能在创建临时文件前拒绝超限。 */
+    private static long requireSingleContentLength(HttpExchange ex)
+            throws JobStore.BadRequestException {
+        List<String> values = ex.getRequestHeaders().get("Content-Length");
+        if (values == null || values.size() != 1) {
+            throw new JobStore.BadRequestException("模型包必须带一个明确的 Content-Length");
+        }
+        String value = values.get(0);
+        if (value == null || !value.matches("0|[1-9][0-9]*")) {
+            throw new JobStore.BadRequestException("Content-Length 不合法");
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw new JobStore.BadRequestException("Content-Length 不合法");
+        }
+    }
+
+    /** 实际读取也逐块累计；声明长度不能替代对真实字节数的约束。 */
+    static long copyModelUpload(InputStream in, java.io.OutputStream out, long limit)
+            throws IOException {
+        if (limit < 0) {
+            throw new IllegalArgumentException("模型包上限不能是负数");
+        }
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+        int n;
+        while ((n = in.read(buffer)) != -1) {
+            if (n == 0) {
+                continue;
+            }
+            if (total > limit - n) {
+                throw new ModelUploadTooLargeException(total + n, limit);
+            }
+            out.write(buffer, 0, n);
+            total += n;
+        }
+        return total;
+    }
+
+    static final class ModelUploadTooLargeException extends IOException {
+        ModelUploadTooLargeException(long size, long limit) {
+            super("模型包太大（已收到或声明 " + size + " 字节，上限 " + limit + " 字节）");
         }
     }
 
