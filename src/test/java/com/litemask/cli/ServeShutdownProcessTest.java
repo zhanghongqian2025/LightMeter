@@ -1,6 +1,8 @@
 package com.litemask.cli;
 
+import com.litemask.ner.ModelManager;
 import com.litemask.server.Json;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -21,7 +23,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -29,6 +36,82 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ServeShutdownProcessTest {
+
+    @Test
+    @Timeout(30)
+    @DisplayName("并发 cleanup 的非 owner 必须等待 owner 完整清理后返回")
+    void concurrentCleanupWaitsForOwner(@TempDir Path tmp) throws Exception {
+        ModelManager models = new ModelManager(tmp.resolve("models"), null, tmp.resolve("bundle"));
+        CountDownLatch ownerInside = new CountDownLatch(1);
+        CountDownLatch allowOwnerFinish = new CountDownLatch(1);
+        ServeCommand.ServiceLifecycle lifecycle = new ServeCommand.ServiceLifecycle(models, () -> {
+            ownerInside.countDown();
+            try {
+                allowOwnerFinish.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        Future<?> owner = pool.submit(lifecycle::cleanup);
+        try {
+            assertTrue(ownerInside.await(5, TimeUnit.SECONDS), "owner 必须已进入资源清理临界区");
+            CountDownLatch followerStarted = new CountDownLatch(1);
+            Future<?> follower = pool.submit(() -> {
+                followerStarted.countDown();
+                lifecycle.cleanup();
+            });
+            assertTrue(followerStarted.await(5, TimeUnit.SECONDS), "非 owner 调用必须已经开始执行");
+            assertThrows(TimeoutException.class, () -> follower.get(200, TimeUnit.MILLISECONDS),
+                    "非 owner 不能在 owner 资源清理未完成时提前返回");
+
+            allowOwnerFinish.countDown();
+            owner.get(5, TimeUnit.SECONDS);
+            follower.get(5, TimeUnit.SECONDS);
+        } finally {
+            allowOwnerFinish.countDown();
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    @DisplayName("Unix SIGTERM 在真实 JVM 被 reap 前删除精确会话目录与会话锁")
+    void sigtermWaitsForCleanupBeforeJvmExit(@TempDir Path tmp) throws Exception {
+        Assumptions.assumeFalse(System.getProperty("os.name", "")
+                .toLowerCase(java.util.Locale.ROOT).contains("windows"));
+        Path home = Files.createDirectories(tmp.resolve("home"));
+        Path workspace = Files.createDirectories(tmp.resolve("workspace"));
+        Process process = startServe(home, workspace);
+        List<String> output = Collections.synchronizedList(new ArrayList<>());
+        Thread drainer = new Thread(() -> drain(process.getInputStream(), output),
+                "serve-sigterm-test-output");
+        drainer.setDaemon(true);
+        drainer.start();
+        try {
+            waitForLineValue(output, "本地脱敏服务已启动", process);
+            Path ownSession = Path.of(waitForLineValue(output, "工作目录", process));
+            Path ownLock = workspace.resolve("locks")
+                    .resolve(ownSession.getFileName().toString() + ".lock");
+            assertTrue(Files.isDirectory(ownSession), "前提：会话目录存在");
+            assertTrue(Files.isRegularFile(ownLock), "前提：精确会话锁存在");
+
+            process.destroy();
+            assertTrue(process.waitFor(30, TimeUnit.SECONDS),
+                    "SIGTERM 后 JVM 未退出，PID=" + process.pid() + "\n" + output);
+            assertFalse(ProcessHandle.of(process.pid()).map(ProcessHandle::isAlive).orElse(false),
+                    "waitFor 返回后 PID 仍存活: " + process.pid());
+            assertFalse(Files.exists(ownSession), "SIGTERM 正常退出不得留下空会话目录");
+            assertFalse(Files.exists(ownLock), "SIGTERM 正常退出不得留下会话锁文件");
+        } finally {
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                process.waitFor(10, TimeUnit.SECONDS);
+            }
+            drainer.join(2_000);
+        }
+    }
 
     @Test
     @Timeout(60)
@@ -44,15 +127,7 @@ class ServeShutdownProcessTest {
         Files.writeString(download, "download", StandardCharsets.UTF_8);
         Files.writeString(modelState, "model-state", StandardCharsets.UTF_8);
 
-        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        ProcessBuilder builder = new ProcessBuilder(java,
-                "-Duser.home=" + home,
-                "-cp", System.getProperty("java.class.path"),
-                Main.class.getName(), "serve",
-                "--no-browser", "--print-token", "--port", "0",
-                "--workspace", workspace.toString());
-        builder.redirectErrorStream(true);
-        Process process = builder.start();
+        Process process = startServe(home, workspace);
         long pid = process.pid();
         List<String> output = Collections.synchronizedList(new ArrayList<>());
         Thread drainer = new Thread(() -> drain(process.getInputStream(), output),
@@ -104,6 +179,18 @@ class ServeShutdownProcessTest {
             }
             drainer.join(2_000);
         }
+    }
+
+    private static Process startServe(Path home, Path workspace) throws IOException {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        ProcessBuilder builder = new ProcessBuilder(java,
+                "-Duser.home=" + home,
+                "-cp", System.getProperty("java.class.path"),
+                Main.class.getName(), "serve",
+                "--no-browser", "--print-token", "--port", "0",
+                "--workspace", workspace.toString());
+        builder.redirectErrorStream(true);
+        return builder.start();
     }
 
     private static void drain(InputStream input, List<String> output) {

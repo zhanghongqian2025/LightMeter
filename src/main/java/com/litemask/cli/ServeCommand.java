@@ -296,14 +296,21 @@ public final class ServeCommand {
     }
 
     /** GUI、安装器与 JVM shutdown hook 共用的单次清理器。 */
-    private static final class ServiceLifecycle {
+    static final class ServiceLifecycle {
         private final CountDownLatch stop = new CountDownLatch(1);
         private final AtomicBoolean cleaned = new AtomicBoolean();
         private final com.litemask.ner.ModelManager models;
+        private final Runnable beforeResourceCleanup;
         private volatile LocalServer server;
 
         ServiceLifecycle(com.litemask.ner.ModelManager models) {
+            this(models, () -> { });
+        }
+
+        /** 测试缝：把清理临界区确定地撑开，验证并发 cleanup 必须等待 owner 完成。 */
+        ServiceLifecycle(com.litemask.ner.ModelManager models, Runnable beforeResourceCleanup) {
             this.models = models;
+            this.beforeResourceCleanup = beforeResourceCleanup;
         }
 
         void attach(LocalServer server) {
@@ -318,11 +325,14 @@ public final class ServeCommand {
             stop.await();
         }
 
-        void cleanup() {
+        synchronized void cleanup() {
             requestStop();
             if (!cleaned.compareAndSet(false, true)) {
                 return;
             }
+            // monitor 要覆盖完整资源清理：JVM 只等待 shutdown hook，不等待普通 main 线程。
+            // hook 若输掉 cleaned 所有权，也必须在这里等 owner 完成后才能返回。
+            beforeResourceCleanup.run();
             LocalServer current = server;
             try {
                 if (current != null) {
